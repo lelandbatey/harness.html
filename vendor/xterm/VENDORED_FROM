@@ -1,0 +1,4 @@
+@xterm/xterm 5.5.0  https://registry.npmjs.org/@xterm/xterm/-/xterm-5.5.0.tgz  (lib/xterm.js, css/xterm.css, LICENSE)
+@xterm/addon-fit 0.10.0  https://registry.npmjs.org/@xterm/addon-fit/-/addon-fit-0.10.0.tgz  (lib/addon-fit.js, LICENSE -> LICENSE.addon-fit)
+Modification: trailing sourceMappingURL comment lines removed.
+Latest 5.x chosen deliberately (6.0 exists); addon-fit 0.10.0 peer-depends on @xterm/xterm ^5.

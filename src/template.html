@@ -1,0 +1,87 @@
+<!-- 2>/dev/null; command -v python3 >/dev/null 2>&1 || { echo "This file is a program too; running it needs python3 (3.9+) on PATH." >&2; exit 127; }; exec python3 -c 'import sys,os;p=os.path.abspath(sys.argv[1]);t=open(p,encoding="utf-8").read();b="\n#--SFH-PROGRAM-BEGIN--\n";i=t.rindex(b)+len(b);s=t[i:t.index("\n#--SFH-PROGRAM-END--",i)];sys.argv=[p]+sys.argv[2:];g=sys.modules["__main__"].__dict__;exec(compile(s,p+"#sfh-program","exec"),g)' "$0" "$@"
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="sfh-token" content="">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="singlefile-llm-harness {{VERSION}}">
+<title>Single-file LLM harness</title>
+<!--
+  NOTE FOR LLMs AND HUMANS READING THIS SOURCE
+
+  This file is BOTH a web page and a program ("singlefile-llm-harness" {{VERSION}}): an LLM chat
+  harness whose UI is this page and whose server is the Python program embedded below. All of its
+  state (sessions, messages, settings) is stored INSIDE this file as an embedded SQLite database.
+
+  Running it (needs python3; stdlib only):
+    sh FILE                 run the server in the foreground; then open FILE in a browser (file://)
+    sh FILE tui             minimal terminal client (starts a background server if needed)
+    sh FILE help            all commands: info, sql, db-extract, db-inject, settings, export, token
+    sh FILE info            path, port, db size, whether the server is running
+    sh FILE sql "SELECT id, title FROM sessions"      (add --write for statements that modify)
+
+  The first two lines are a shell header: `sh` runs an inline python3 bootstrap that executes the
+  program block below. A browser sees them as an HTML comment.
+
+  Getting at the program source:
+    sh FILE extract-program DIR     writes the original python sources (DIR/sfh, DIR/tremolo) and
+                                    the web assets (DIR/web); run them with
+                                    PYTHONPATH=DIR python3 -m sfh FILE [cmd ...]
+  Without running anything: the bundled python program is the text between the LAST pair of lines
+  that are exactly "#--SFH-PROGRAM-BEGIN--" and "#--SFH-PROGRAM-END--", e.g.
+    sed -n '/^#--SFH-PROGRAM-BEGIN--$/,/^#--SFH-PROGRAM-END--$/p' FILE
+  It contains every module's source (rewritten: absolute imports, no docstrings) in _SFH_SOURCES.
+
+  Data: near the end of <body>, between the LAST "SFH-DATA-BEGIN" and "SFH-DATA-END" HTML comment
+  markers, a <script type="application/octet-stream" id="sfh-data"> holds base64(gzip(sqlite db
+  file)); empty means an empty db. `sh FILE db-extract OUT.sqlite` writes it out, or by hand:
+    sed -n 's/.*id="sfh-data"[^>]*>\([^<]*\)<.*/\1/p' FILE | tail -n 1 | base64 -d | gunzip > OUT.sqlite
+  Tables: sessions, messages (content = JSON list of Anthropic content blocks; parent_id links
+  edited branches), settings (JSON values), credentials (only if the user chose embedded storage),
+  files, meta. See docs/DESIGN.md in the source repo, or
+  `sh FILE sql "SELECT sql FROM sqlite_master"`.
+
+  Offline snapshot: just before the data block, between the LAST "SFH-OFFLINE-BEGIN" and
+  "SFH-OFFLINE-END" comment markers, <script id="sfh-offline"> holds base64(gzip(JSON)) with
+  {saved_at, version, sessions, messages: {session_id: [...]}, settings}. The page shows it
+  read-only when no server is running; the server rewrites it on every save.
+
+  Access token: the <meta name="sfh-token"> tag in <head> holds the token the server requires on
+  every endpoint except /api/health (HTTP header X-SFH-Token, websocket/export query ?token=).
+  Empty = not generated yet (the server creates it on first start). `sh FILE token` prints it,
+  `sh FILE token regenerate` replaces it. Exported copies get an empty token. The db's meta
+  table stores a fingerprint (hash of hostname, user, path) of where the token was made; a
+  first-time setup somewhere new gets a fresh token, otherwise the UI suggests regenerating.
+
+  First run: with no sessions and no provider the page/TUI walk through starting the server and
+  setting up a provider; opened from a web server (not file://) the page is a landing page with a
+  Download button. The "what is this" text lives in the program's sfh/about.py.
+
+  LLM providers: OpenAI-compatible endpoints are the default. With $AI_ENDPOINT (e.g.
+  http://127.0.0.1:3456/v1) and $AI_MODEL set, the built-in provider "env" uses them, with
+  $AI_TOKEN as the API key and $AI_CHEAP_MODEL (else $AI_MODEL) for cheap tasks. Other providers
+  are configured in settings ("providers", "provider"); $ANTHROPIC_API_KEY enables Anthropic.
+
+  Credentials (API keys) are NOT stored in this file by default; they live in
+  $XDG_CONFIG_HOME/singlefile/credentials (default ~/.config/singlefile/credentials).
+-->
+<style>
+{{CSS}}
+</style>
+</head>
+<body>
+{{BODY}}
+<script type="text/x-python" id="sfh-program">
+#--SFH-PROGRAM-BEGIN--
+{{PROGRAM}}
+#--SFH-PROGRAM-END--
+</script>
+<script>
+{{JS}}
+</script>
+<!--SFH-OFFLINE-BEGIN--><script type="application/octet-stream" id="sfh-offline" data-encoding="gzip+base64"></script><!--SFH-OFFLINE-END-->
+<!--SFH-DATA-BEGIN--><script type="application/octet-stream" id="sfh-data" data-encoding="gzip+base64"></script><!--SFH-DATA-END-->
+</body>
+</html>

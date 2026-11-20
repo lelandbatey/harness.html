@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>SFH identicon demo</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 2em; background: #fafafa; color: #222; }
+  @media (prefers-color-scheme: dark) { body { background: #16181c; color: #ddd; } }
+  h2 { font-size: 15px; margin: 1.6em 0 .4em; }
+  .row { display: flex; flex-wrap: wrap; gap: 14px; }
+  .s { width: 150px; font-size: 11px; line-height: 1.3; }
+  .s .icons { display: flex; align-items: end; gap: 8px; margin-bottom: 4px; }
+  .strip { display: flex; gap: 4px; margin: .5em 0 1em; }
+</style></head>
+<body>
+<h1>Semantic identicons</h1>
+<p>Plain square tile (no rounding). Tile color = subject[0] (domain). Mirrored wings = subject[1] (topic, SimHash of words).
+Center spine shape = session id; spine color = subject[2]. Same group should look related; every icon should differ.</p>
+<div>All at 16px, as in the sidebar:</div><div class="strip" id="strip"></div>
+<div id="groups"></div>
+<script src="../src/web/identicon.js"></script>
+<script>
+const groups = {
+  "Python web servers": [
+    ["programming", "python web servers", "tremolo websocket bug"],
+    ["programming", "python web servers", "tremolo websocket bug"],
+    ["programming", "python web server", "asgi lifespan"],
+    ["programming", "python web frameworks", "flask routing"],
+  ],
+  "Python other": [
+    ["programming", "python packaging", "pyproject build backend"],
+    ["programming", "python testing", "pytest fixtures"],
+  ],
+  "JavaScript": [
+    ["programming", "javascript markdown rendering", "gfm tables"],
+    ["programming", "javascript markdown rendering", "streaming code fences"],
+    ["web development", "css layout", "flexbox sidebar"],
+  ],
+  "Ops": [
+    ["devops", "kubernetes deployments", "crashlooping pod"],
+    ["devops", "kubernetes deployments", "helm values"],
+    ["devops", "terraform", "s3 bucket policy"],
+  ],
+  "Cooking": [
+    ["cooking", "bread baking", "sourdough starter"],
+    ["cooking", "bread baking", "focaccia hydration"],
+    ["cooking", "weeknight dinners", "sheet pan chicken"],
+  ],
+  "Finance": [
+    ["personal finance", "retirement accounts", "roth conversion"],
+    ["personal finance", "taxes", "quarterly estimates"],
+  ],
+  "Fallbacks (no subjects)": [
+    { title: "Fix the flaky websocket reconnect test" },
+    { title: "Fix flaky websocket reconnect" },
+    { title: "" },
+    { title: "" },
+  ],
+};
+let n = 0;
+const strip = document.getElementById("strip"), root = document.getElementById("groups");
+for (const [name, list] of Object.entries(groups)) {
+  const h = document.createElement("h2"); h.textContent = name; root.appendChild(h);
+  const row = document.createElement("div"); row.className = "row"; root.appendChild(row);
+  for (const item of list) {
+    const s = Array.isArray(item) ? { id: "s_" + (++n).toString(16).padStart(8, "0"), subjects: item } : { id: "s_f" + (++n), ...item };
+    const d = document.createElement("div"); d.className = "s";
+    d.innerHTML = '<div class="icons">' + SFHIdenticon.svg(s, 16) + SFHIdenticon.svg(s, 32) + SFHIdenticon.svg(s, 64) + "</div>";
+    const t = document.createElement("div"); t.textContent = s.id + ": " + (s.subjects ? s.subjects.join(" › ") : JSON.stringify(s.title)); d.appendChild(t);
+    row.appendChild(d);
+    strip.insertAdjacentHTML("beforeend", SFHIdenticon.svg(s, 16));
+  }
+}
+</script>
+</body></html>

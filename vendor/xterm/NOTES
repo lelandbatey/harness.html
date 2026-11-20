@@ -1,0 +1,2 @@
+Inline-safety check (2026-11-18): none of </script, <script, <!--, -->, </style occur in xterm.js, addon-fit.js or xterm.css. No escaping needed.
+Globals: UMD sets window.Terminal and window.FitAddon (use new FitAddon.FitAddon()).
