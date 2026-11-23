@@ -1886,7 +1886,7 @@
             b.kind === "root" || b.kind === "edit" ? null : el("span", { class: "bm-glyph", text: threadGlyph(b) + " " }), b.name),
           el("span", { class: "bm-row-sub" },
             el("span", { class: "btag", text: kindTag }),
-            el("span", { text: b.own_messages + "m" }),
+            el("span", { text: b.own_messages + (b.own_messages === 1 ? " msg" : " msgs") }),
             b.status === "running" ? el("span", { class: "status-dot", title: "running" }) : null));
       } else {
         label = el("div", { class: "bm-row-info small" },
