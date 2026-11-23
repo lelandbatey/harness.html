@@ -398,6 +398,17 @@ Server → client: `{"type":"output","data":"…"}` (utf-8, errors=replace) and
   `finish_reason "tool_calls"` → stop_reason tool_use. History conversion: tool_use →
   assistant `tool_calls`, tool_result → `role: "tool"` messages, thinking dropped; system prompt as
   first `system` message. Tools as `{"type":"function","function":{name,description,parameters}}`.
+- Images and PDFs (`sfh/media.py`): `read` on a png/jpeg/gif/webp/pdf returns `[text, pointer]`, where the
+  pointer is `{"type":"image"|"document","source":{"type":"path","path","media_type","sha256","size"},
+  "width"?,"height"?}`. Only the pointer is stored (messages, db, html file); file bytes never are. Each
+  request body build re-reads the file, checks the sha256, and inlines it as base64: an Anthropic
+  `image`/`document` block, or OpenAI `image_url` / `file` (`file_data`) parts with data URLs. If the file is
+  missing or its hash changed, the model gets a text note telling it to read the file again. Limits: images
+  3.75 MB (under the API's 5 MB base64 cap) and 8000 px per side; PDFs 24 MB. Audio and video aren't sent.
+  Per-provider options in `providers`: `media: false` sends notes instead of files (for text-only models).
+  `media_in_tool_results: false` (openai) puts text only in the `tool` message and sends the files in a
+  following `user` message, for endpoints like OpenAI's own that refuse image parts in tool messages. The
+  default `true` works with Meridian, which maps the parts to an Anthropic `tool_result` with images.
 - `hello` result `provider` becomes `{"id","type","model","cheap_model"}`; RPC `providers.list` →
   `[{id,type,base_url,model,cheap_model,builtin:bool,has_key:bool}]`.
 

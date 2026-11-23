@@ -904,7 +904,11 @@ class Agent:
                 cancel_wait.cancel()
                 if fut.done():
                     out, is_err = fut.result()
-                    out += self.peers.after_tool(sid, tu["name"], inp, is_err)
+                    warn = self.peers.after_tool(sid, tu["name"], inp, is_err)
+                    if warn and isinstance(out, list):
+                        out = out + [{"type": "text", "text": warn.lstrip("\n")}]
+                    elif warn:
+                        out += warn
                 else:
                     out, is_err = "interrupted", True
                 t1 = now_ms()

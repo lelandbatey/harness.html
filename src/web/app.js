@@ -2506,7 +2506,9 @@
   function resultText(b) {
     var c = b.content;
     if (typeof c === "string") return c;
-    if (Array.isArray(c)) return c.map(function (x) { return x.type === "text" ? x.text : "[" + x.type + "]"; }).join("\n");
+    // image/document blocks are pointers (path + hash) to a file sent to the provider, never its bytes
+    if (Array.isArray(c)) return c.filter(function (x) { return x && (x.type !== "text" || x.text); })
+      .map(function (x) { return x.type === "text" ? x.text : "[" + x.type + (x.source && x.source.path ? ": " + x.source.path : "") + "]"; }).join("\n");
     return c == null ? "" : JSON.stringify(c, null, 2);
   }
 

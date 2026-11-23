@@ -7,6 +7,8 @@ import signal
 import subprocess
 import threading
 
+from . import media
+
 MAX_OUTPUT = 30000
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv"}
 
@@ -19,8 +21,9 @@ DEFINITIONS = [
          "timeout": {"type": "integer", "description": "Timeout in seconds (default 120)"}},
          "required": ["command"]}},
     {"name": "read",
-     "description": "Read a text file. Returns lines prefixed with their 1-based line numbers. Use offset/limit "
-                    "for large files (default: first 2000 lines).",
+     "description": "Read a file. Text files: returns lines prefixed with their 1-based line numbers; use "
+                    "offset/limit for large files (default: first 2000 lines). Images (png, jpeg, gif, webp) and "
+                    "PDFs are attached so you can see them (offset/limit don't apply).",
      "input_schema": {"type": "object", "properties": {
          "path": {"type": "string"},
          "offset": {"type": "integer", "description": "1-based line to start at"},
@@ -157,7 +160,8 @@ def truncate(s, limit=MAX_OUTPUT):
 
 
 def execute(name, inp, ctx):
-    """Returns (text, is_error)."""
+    """Returns (result, is_error). result is a string, or (from `read` on an image/PDF) a list of content
+    blocks: text plus media.pointer() blocks, which hold a path and hash, never the file's bytes."""
     fn = globals().get("tool_" + str(name))
     if fn is None:
         return "unknown tool: %s" % name, True
@@ -208,6 +212,13 @@ def tool_read(ctx, path, offset=1, limit=2000):
         raise ToolError("%s is a directory: %s" % (path, ", ".join(sorted(os.listdir(p))[:200])))
     with open(p, "rb") as f:
         data = f.read()
+    mt = media.sniff(data[:16])
+    if mt:
+        try:
+            block = media.pointer(p, data, mt)
+        except media.MediaError as e:
+            raise ToolError(str(e))
+        return [{"type": "text", "text": media.describe(block) + ", attached"}, block]
     if b"\0" in data[:8192]:
         raise ToolError("%s looks like a binary file (%d bytes)" % (path, len(data)))
     lines = data.decode("utf-8", "replace").splitlines()

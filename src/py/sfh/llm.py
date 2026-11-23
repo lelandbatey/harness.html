@@ -9,7 +9,15 @@ A stream is an iterable of normalized events (blocking; consume it in a thread):
 close() aborts it from any thread.
 
 A provider is a dict {"id", "type": "openai"|"anthropic"|"mock", "base_url", "model", "cheap_model",
-"api_key_credential"}; see providers()/resolve_provider()."""
+"api_key_credential", "media", "media_in_tool_results"}; see providers()/resolve_provider().
+
+Images/PDFs: history holds only media.pointer() blocks (path + sha256). The file is read and base64'd while a
+request body is built (media.inline), so its bytes are sent but never stored. Provider options:
+  media: false                  send a text note instead of files (for models that take no images)
+  media_in_tool_results: false  (openai type) the tool message gets text only and the files follow in a
+                                user message; for endpoints that, like OpenAI's own, refuse non-text parts
+                                in tool messages. Default true (works with Meridian, LiteLLM, vLLM, ...)."""
+import base64
 import json
 import os
 import random
@@ -20,6 +28,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from . import media
 
 API_URL = "https://api.anthropic.com"
 API_VERSION = "2023-06-01"
@@ -90,6 +100,8 @@ def providers(settings, creds):
                     "cheap_model": p.get("cheap_model") or p.get("model") or
                     (ANTHROPIC_CHEAP_MODEL if t == "anthropic" else None),
                     "api_key_credential": p.get("api_key_credential"), "pricing_url": p.get("pricing_url"),
+                    "media": p.get("media") is not False,
+                    "media_in_tool_results": p.get("media_in_tool_results") is not False,
                     "builtin": False})
     if not any(p["id"] == "anthropic" for p in out):
         out.append({"id": "anthropic", "type": "anthropic", "base_url": None, "model": ANTHROPIC_MODEL,
@@ -189,9 +201,15 @@ def sanitize_messages(messages, model=None):
                 inp = b.get("input")
                 blocks.append({"type": "tool_use", "id": b["id"], "name": b["name"],
                                "input": inp if isinstance(inp, dict) else {}})
+            elif t in ("image", "document"):
+                blocks.append(b)
             elif t == "tool_result":
+                content = b.get("content")
+                if isinstance(content, list):
+                    content = [x for x in content if media.is_media(x) or (isinstance(x, dict) and
+                               x.get("type") == "text" and x.get("text"))]
                 blocks.append({"type": "tool_result", "tool_use_id": b["tool_use_id"],
-                               "content": b.get("content") or "(no output)", "is_error": bool(b.get("is_error"))})
+                               "content": content or "(no output)", "is_error": bool(b.get("is_error"))})
         if not blocks:
             continue
         if out and out[-1]["role"] == m["role"]:
@@ -204,6 +222,24 @@ def sanitize_messages(messages, model=None):
     for m in out:
         if m["role"] == "user":
             m["content"].sort(key=lambda b: 0 if b["type"] == "tool_result" else 1)
+    return out
+
+
+def inline_media(messages, enabled=True):
+    """sanitize_messages() output with every media pointer replaced by its file's bytes (media.inline): new
+    lists/dicts, the stored history is not touched. Only ever passed on to a request body."""
+    def conv(blocks):
+        return [media.inline(x, enabled) if media.is_media(x) else x for x in blocks]
+    out = []
+    for m in messages:
+        content = []
+        for b in m["content"]:
+            if b.get("type") == "tool_result" and isinstance(b.get("content"), list):
+                b = dict(b, content=conv(b["content"]))
+            elif media.is_media(b):
+                b = media.inline(b, enabled)
+            content.append(b)
+        out.append(dict(m, content=content))
     return out
 
 
@@ -478,10 +514,11 @@ def _anthropic_post(provider, creds, body, stream, timeout=None, idle_timeout=No
 
 
 def build_body(model, system, messages, tools=None, max_tokens=16000, thinking_budget=0, effort=None,
-               adaptive=None):
+               adaptive=None, media_ok=True):
     """With an effort level: output_config.effort, and adaptive thinking unless the model is known not to
     support it (adaptive False; then the thinking budget applies as without an effort)."""
-    body = {"model": model, "max_tokens": int(max_tokens), "messages": sanitize_messages(messages, model)}
+    body = {"model": model, "max_tokens": int(max_tokens),
+            "messages": inline_media(sanitize_messages(messages, model), media_ok)}
     if system:
         body["system"] = system
     if tools:
@@ -569,11 +606,23 @@ def _tool_result_text(content):
     return str(content or "(no output)")
 
 
-def openai_messages(system, messages):
-    """Stored (Anthropic-shaped) history -> Chat Completions messages. Thinking is dropped."""
+def openai_part(block):
+    """An Anthropic text block or inlined (base64) image/document block -> a Chat Completions content part."""
+    if block.get("type") == "image":
+        return {"type": "image_url", "image_url": {"url": media.data_url(block)}}
+    if block.get("type") == "document":
+        return {"type": "file", "file": {"filename": block.get("title") or "document.pdf",
+                                         "file_data": media.data_url(block)}}
+    return {"type": "text", "text": block.get("text", "")}
+
+
+def openai_messages(system, messages, media_ok=True, media_in_tool_results=True):
+    """Stored (Anthropic-shaped) history -> Chat Completions messages. Thinking is dropped. Media pointers are
+    read and inlined as image_url / file parts (see the module docstring for the two provider options)."""
     out = [{"role": "system", "content": system}] if system else []
-    for m in messages:
+    for m in inline_media(messages, media_ok):
         texts = [b["text"] for b in m["content"] if b.get("type") == "text" and b.get("text")]
+        files = [b for b in m["content"] if b.get("type") in ("image", "document")]
         if m["role"] == "assistant":
             calls = [{"id": b["id"], "type": "function",
                       "function": {"name": b["name"], "arguments": json.dumps(b.get("input") or {})}}
@@ -585,12 +634,28 @@ def openai_messages(system, messages):
                 msg["tool_calls"] = calls
             out.append(msg)
         else:
+            deferred = []  # tool-result files that go in the user message after the tool messages
             for b in m["content"]:
-                if b.get("type") == "tool_result":
-                    text = _tool_result_text(b.get("content"))
-                    out.append({"role": "tool", "tool_call_id": b["tool_use_id"],
-                                "content": ("ERROR: " + text) if b.get("is_error") else text})
-            if texts:
+                if b.get("type") != "tool_result":
+                    continue
+                content = b.get("content")
+                tfiles = [x for x in content if x.get("type") in ("image", "document")] if isinstance(content, list) else []
+                text = _tool_result_text(content)
+                if b.get("is_error"):
+                    text = "ERROR: " + text
+                if tfiles and media_in_tool_results:
+                    parts = [{"type": "text", "text": text}] + [openai_part(x) for x in tfiles]
+                    out.append({"role": "tool", "tool_call_id": b["tool_use_id"], "content": parts})
+                    continue
+                if tfiles:
+                    text += "\n[%d file(s) attached in the next user message]" % len(tfiles)
+                    deferred += [{"type": "text", "text": "Files from tool call %s:" % b["tool_use_id"]}] + tfiles
+                out.append({"role": "tool", "tool_call_id": b["tool_use_id"], "content": text})
+            if deferred or files:
+                parts = [openai_part(x) for x in deferred]
+                parts += [{"type": "text", "text": t} for t in texts] + [openai_part(x) for x in files]
+                out.append({"role": "user", "content": parts})
+            elif texts:
                 out.append({"role": "user", "content": "\n\n".join(texts)})
     return out
 
@@ -602,8 +667,10 @@ def openai_tools(tools):
             for t in tools or []]
 
 
-def build_openai_body(model, system, messages, tools=None, max_tokens=16000, effort=None):
-    body = {"model": model, "messages": openai_messages(system, messages), "max_tokens": int(max_tokens),
+def build_openai_body(model, system, messages, tools=None, max_tokens=16000, effort=None, media_ok=True,
+                      media_in_tool_results=True):
+    body = {"model": model, "messages": openai_messages(system, messages, media_ok, media_in_tool_results),
+            "max_tokens": int(max_tokens),
             "stream_options": {"include_usage": True}}
     if effort:
         body["reasoning_effort"] = effort
@@ -799,7 +866,18 @@ class MockStream:
         else:
             content = results[0].get("content")
             if isinstance(content, list):
-                content = "".join(x.get("text", "") for x in content if isinstance(x, dict))
+                # what a provider would get for each attached file: its bytes (read now), or a note
+                pieces = []
+                for x in content:
+                    x = media.inline(x) if media.is_media(x) else x
+                    if not isinstance(x, dict):
+                        continue
+                    if x.get("type") == "text":
+                        pieces.append(x.get("text", ""))
+                    elif x.get("source", {}).get("type") == "base64":
+                        pieces.append("[saw %s, %d bytes]" % (x["source"]["media_type"],
+                                                            len(base64.b64decode(x["source"]["data"]))))
+                content = " ".join(pieces)
             reply = "Tool said: " + str(content or "")[:200]
         yield ("block", idx, {"type": "text", "text": ""})
         for c in self._chunks(reply):
@@ -836,9 +914,13 @@ def stream(provider, creds, model, system, messages, tools=None, max_tokens=1600
     model = model or provider["model"]
     if t == "anthropic":
         return AnthropicStream(provider, creds, build_body(model, system, messages, tools, max_tokens,
-                                                           thinking_budget, effort, adaptive), timeout, idle_timeout)
+                                                           thinking_budget, effort, adaptive,
+                                                           provider.get("media") is not False),
+                               timeout, idle_timeout)
     if t == "openai":
-        return OpenAIStream(provider, creds, build_openai_body(model, system, messages, tools, max_tokens, effort),
+        return OpenAIStream(provider, creds, build_openai_body(model, system, messages, tools, max_tokens, effort,
+                                                               provider.get("media") is not False,
+                                                               provider.get("media_in_tool_results") is not False),
                             timeout, idle_timeout)
     raise LLMError("unknown provider type %r" % t)
 

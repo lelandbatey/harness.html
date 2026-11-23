@@ -149,6 +149,8 @@ This harness runs in server mode with an HTTP/websocket API, and has two clients
   sub-agents. Depth limit is 5 deep. Max total sub-agents running at once 50
 - Agents can communicate with other running agents in order to negotiate locks, priorities, ask
   questions, etc
+- Agents can read image, audio, video, or other files directly to their provider, if the provider
+  supports it.
 - Durations for messages in a session indicate how long they took to run; how long thinking tokens
   were streaming in, or how long a tool took to run
 - The user can change which effort level, model and provider they are using, even mid-conversation, so each
