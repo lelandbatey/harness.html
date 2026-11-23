@@ -1829,7 +1829,9 @@
         S.offline ? null : el("button", { class: "link-btn", type: "button", title: "Start a new aside from the current tip (/aside)",
           text: "+ Aside", onclick: function () { startAsideFrom(null); } }),
         el("button", { class: "icon-btn", type: "button", style: "width:22px;height:22px", title: "Minimize to compact minimap", text: "⇥",
-          onclick: function () { setMinimapExpanded(false); } })),
+          // stopPropagation: the re-render installs the minimal mode's "expand" onclick on the
+          // aside this click is still bubbling to, which would immediately re-expand it
+          onclick: function (e) { e.stopPropagation(); setMinimapExpanded(false); } })),
       el("div", { class: "bm-body" }, el("div", { class: "bm-graph-wrap" }, svg, rows)));
   }
 

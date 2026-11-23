@@ -394,6 +394,17 @@ await p1.evaluate((r) => { location.hash = "#session/" + encodeURIComponent(wind
 await waitFor(p1, (r) => window.SFHApp.current.branchId === r && !window.SFHApp.current.loading, "back on the root thread", 8000, rootBid);
 step("spatial view: modes by width, sideways navigation, collapsed history, ★ main tag, +N stack");
 
+// 9b3. minimap: real mouse clicks open the sidebar and ⇥ closes it again (the click must not bubble into the
+// freshly re-rendered minimal strip, whose own click handler would re-expand it)
+await p1.evaluate(() => { if (window.SFHApp.current.minimapExpanded) document.querySelector(".branch-minimap.expanded .bm-head .icon-btn").click(); });
+await waitFor(p1, () => document.querySelector(".branch-minimap.minimal:not([hidden])"), "minimal minimap", 5000);
+await p1.click(".branch-minimap.minimal");
+await waitFor(p1, () => document.querySelector(".branch-minimap.expanded .bm-head .icon-btn"), "minimap expanded by a click", 5000);
+await p1.click(".branch-minimap.expanded .bm-head .icon-btn");
+await new Promise((r) => setTimeout(r, 150));
+await waitFor(p1, () => document.querySelector(".branch-minimap.minimal") && !window.SFHApp.current.minimapExpanded, "⇥ minimizes the sidebar", 5000);
+step("minimap: click expands to the sidebar, ⇥ minimizes it back");
+
 // 9c. peer sessions: a second session in the same directory asks this one a question (held: it is the
 // user's idle session), the peer strip + inbox show it, "Let it answer" delivers it; a shared file is flagged
 await typeInto(p1, ".composer textarea", '[[tool:write:{"path": "peer-file.txt", "content": "x"}]]');
