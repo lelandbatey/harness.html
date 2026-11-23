@@ -127,7 +127,6 @@ class Context:
     def __init__(self, cwd, load_skill=None):
         self.cwd = cwd
         self.load_skill = load_skill
-        self.subagent = None     # callable(description, prompt, session_id) -> text; None in child sessions
         self.peer = None         # peers.ToolBridge
         self.branch = None       # branches.ToolBridge
         self.procs = set()
@@ -324,17 +323,11 @@ def tool_webfetch(ctx, url, format="markdown", timeout=30):
 
 
 def tool_subagent(ctx, description, prompt, session_id=None, context="fresh"):
-    """Backwards-compatible alias for `spawn` (or `message` when continuing an existing thread/session)."""
+    """Alias for `spawn` (or `message` when continuing an existing thread) for models that call the
+    tool by its old name (from older conversations)."""
     if session_id:
-        if ctx.branch:
-            return ctx.branch.message(session_id, prompt, "task", None)
-        if ctx.subagent:
-            return ctx.subagent(description, prompt, session_id)
-    if ctx.branch:
-        return ctx.branch.spawn(description, prompt, context)
-    if not ctx.subagent:
-        raise ToolError("subagents are not available here (subagents cannot launch subagents)")
-    return ctx.subagent(description, prompt, session_id)
+        return _branch(ctx).message(session_id, prompt, "task", None)
+    return _branch(ctx).spawn(description, prompt, context)
 
 
 def _peer(ctx):

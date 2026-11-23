@@ -1226,3 +1226,41 @@ subagent anchors while running and after, placeholder tips, multiple edits, asid
 - An unnamed root thread (sessions from before this) shows the session title instead of `Main`/`Original`.
 - `/retitle` on the main thread regenerates both the session title/subjects and the thread's title; on any other
   thread only that thread's. Moving the main tag never renames anything.
+
+## v20: nested subagents, `/subsession`
+
+### Nested subagents (README: "Sub-agents are also agents, so can also start sub-agents")
+- Subagent threads may `spawn` subagents. `branches.subagent_depth` counts the `kind='subagent'` threads up the
+  `parent_branch_id` chain (0 on root/aside/edit threads). `MAX_SUBAGENT_DEPTH = 5`: at depth 5 `spawn` is not
+  offered (`tool_defs`) and refused; `MAX_RUNNING_SUBAGENTS = 50` subagent threads may run at once across all
+  sessions of the server (`running_subagents`), else `spawn` fails with a tool error.
+- The subagent system note tells the model its depth and when spawning is worth it (or that it is at the limit).
+- Reporting: a subagent that ends a run while subagents it spawned still run does not report yet (`rt.awaiting`).
+  Reports of its subagents start new runs on it; `turn_finished`'s delivery re-arms its `notify_branch` to its
+  parent thread, so the run handling the last report sends the (one) report up. Runs started by other threads or
+  peer questions still don't report to the parent.
+- Stopping cascades: `stop_branch` first stops the thread's subagents recursively, which then don't report
+  (`suppress_notify`), so a stopped parent isn't restarted by their `stopped` reports. An idle subagent that was
+  waiting for its stopped subagents reports `status="stopped"` itself. `stop_all` (session delete) suppresses all.
+- Mock: `[[nest:N]]` spawns a chain of N nested subagents (`[[nest:N:slow]]`: the last one is slow).
+
+### Subsessions (README: `/subsession`)
+- `/subsession [message]` (or RPC `sessions.create {parent_id}`) creates a child session (`sessions.parent_id`,
+  `kind='subsession'`) with an empty context in the parent's cwd, with its provider/model/effort choice. It is a
+  full session the user converses with; its cwd and model are its own afterwards. The requesting client gets a
+  `session.open {session_id}` event and switches to it (web: route; TUI: `open_session` after draining events).
+- Its system prompt notes the parent session (`subsessions.system_note`); the parent is treated like a peer.
+- Summaries: `children` count, `kind`; `usage_subsessions` (was `usage_subagents`) sums all descendant sessions,
+  and `add_usage` re-broadcasts every ancestor. Sidebar/grid/TUI label child sessions "subsessions" (old child
+  sessions of kind `subagent` still show as such).
+- Peers: subsessions are never woken by peer questions (user-owned; `may_wake` only wakes old `subagent`
+  sessions) and appear in each other's `<peer-sessions>` conflict notes (only old subagent parent/child pairs
+  are left out).
+- Deleting a session keeps its subsessions as top-level sessions (`parent_id` cleared).
+- Removed `subagents.py`: launching subagents as child sessions was unreachable since v17 (every tool context has
+  `ctx.branch`, so the `subagent` alias always went to `spawn`). Old `<subagent-result>` messages still render.
+
+### Tests
+`test/test_subagents.py`: nesting to depth 5 and the refusal at depth 5, one report after the nested report,
+stop cascades (a mid-level stop, stopping main silently). `test/test_subsessions.py`: the command, inherited
+model, own cwd/model, nested subsessions, cost roll-up, parent delete.

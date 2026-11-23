@@ -1,13 +1,15 @@
 """Server-side slash commands (texts sent with chat.send that start with "/")."""
 import asyncio
 
-from . import about, branches, llm, skills
+from . import about, branches, llm, skills, subsessions
 
 COMMANDS = [
     {"name": "help", "description": "List the available commands"},
     {"name": "aside", "description": "/aside [message] — start a new side-branch from the current message and switch to it"},
     {"name": "branch", "description": "/branch [id|name|main|promote|rename <title>] — switch, promote or rename branches"},
     {"name": "branches", "description": "List all branches (asides) of this session"},
+    {"name": "subsession", "description": "/subsession [message] — start a new conversation with an empty context in "
+                                          "this session's directory, nested under this session, and switch to it"},
     {"name": "btw", "description": "/btw <question> — ask a side question using this session's context; "
                                    "the answer is not added to the conversation"},
     {"name": "retitle", "description": "Regenerate this thread's title (on the main thread, also the session title and subjects)"},
@@ -66,6 +68,15 @@ async def handle(server, client, sid, text, branch_id=None):
             await agent.send(sid, arg, branch_id=b["id"])
         else:
             notice("Started aside branch `%s`. Send a message here, or switch back with `/branch main`." % b["id"])
+    elif name == "subsession":
+        if arg and not server.has_provider():
+            return notice(llm.NO_PROVIDER, "error")
+        s = subsessions.create(agent, sid)
+        if client is not None:
+            client.event("session.open", {"session_id": s["id"], "from_session_id": sid})
+        if arg:
+            await agent.send(s["id"], arg)
+        notice("Started subsession `%s`. Return here from its header or the session list." % s["id"])
     elif name == "branches":
         notice("**Threads**\n\n```\n%s\n```" % branches.branches_text(agent, sid, bid))
     elif name == "branch":

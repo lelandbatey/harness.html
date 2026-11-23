@@ -70,7 +70,8 @@ class TestSubagents(unittest.TestCase):
         return self.c.call("sessions.subscribe", p)["messages"]
 
     def results(self, sid):
-        return [texts(m) for m in self.messages(sid) if m["role"] == "user" and "<thread-message" in texts(m)]
+        main_bid = self.c.call("branches.list", {"session_id": sid})["main_branch_id"]
+        return [texts(m) for m in self.messages(sid, main_bid) if m["role"] == "user" and "<thread-message" in texts(m)]
 
     def summary(self, sid):
         return next(s for s in self.c.call("sessions.list") if s["id"] == sid)
@@ -153,17 +154,63 @@ class TestSubagents(unittest.TestCase):
         self.assertIn('status="stopped"', res[0])
         self.assertIn(child["id"], res[0])
 
-    def test_child_cannot_launch_subagents(self):
+    def by_depth(self, sid):
+        """{depth: subagent thread} for a chain of nested subagents (depth 1 = spawned by the main thread)."""
+        kids = {k["id"]: k for k in self.subagent_threads(sid)}
+        out = {}
+        for k in kids.values():
+            d, p = 1, k["parent_branch_id"]
+            while p in kids:
+                d, p = d + 1, kids[p]["parent_branch_id"]
+            out[d] = k
+        return out
+
+    def test_nested_subagents_up_to_max_depth(self):
         sid = self.new_session()
-        self.c.call("chat.send", {"session_id": sid, "text": "[[subagent:nested [[subagent:deeper]]]]"})
-        res = self.wait_for(lambda: self.results(sid))
-        kids = self.subagent_threads(sid)
-        self.assertEqual(len(kids), 1)
-        child = kids[0]
-        tr = [b for m in self.messages(sid, child["id"]) for b in m["content"] if b.get("type") == "tool_result"]
+        self.c.call("chat.send", {"session_id": sid, "text": "[[nest:6]]"})
+        res = self.wait_for(lambda: self.results(sid), 40)
+        kids = self.by_depth(sid)
+        # depth 1..5 exist; the depth-5 thread could not spawn a 6th level
+        self.assertEqual(sorted(kids), [1, 2, 3, 4, 5])
+        self.assertEqual(len(self.subagent_threads(sid)), 5)
+        leaf = kids[5]
+        tr = [b for m in self.messages(sid, leaf["id"]) for b in m["content"] if b.get("type") == "tool_result"]
         self.assertTrue(tr[0]["is_error"])
-        self.assertIn("not available", tr[0]["content"])
+        self.assertIn("maximum subagent depth", tr[0]["content"])
+        # the top subagent reported only once, after its own subagent's report came in
+        self.wait_for(lambda: self.summary(sid)["status"] == "idle", 20)
+        res = self.results(sid)
+        self.assertEqual(len(res), 1, res)
+        self.assertIn(kids[1]["id"], res[0])
         self.assertIn('status="completed"', res[0])
+        self.assertIn("thread-message", res[0].split(">", 1)[1])  # its final reply answered the nested report
+
+    def test_stop_cascades_to_nested_subagents(self):
+        sid = self.new_session()
+        self.c.call("chat.send", {"session_id": sid, "text": "[[nest:2:slow]]"})
+        leaf = self.wait_for(lambda: self.by_depth(sid).get(2, {}).get("status") == "running"
+                             and self.by_depth(sid)[2], 20)
+        mid = self.by_depth(sid)[1]
+        self.c.call("chat.stop", {"session_id": sid, "branch_id": mid["id"]})
+        self.wait_for(lambda: all(k["status"] == "idle" for k in self.subagent_threads(sid)), 10)
+        res = self.wait_for(lambda: self.results(sid))
+        self.assertIn(mid["id"], res[0])
+        self.assertIn('status="stopped"', res[0])
+        # the stopped leaf did not report to its (stopped) parent
+        time.sleep(0.5)
+        self.assertFalse([m for m in self.messages(sid, mid["id"]) if "<thread-message" in texts(m)])
+        self.assertEqual(len(self.results(sid)), 1)
+        self.assertFalse(any("leaf" in r and leaf["id"] in r for r in self.results(sid)))
+
+    def test_stopping_main_stops_its_subagents_silently(self):
+        sid = self.new_session()
+        main_bid = self.c.call("branches.list", {"session_id": sid})["main_branch_id"]
+        self.c.call("chat.send", {"session_id": sid, "text": "[[nest:1:slow]]"})
+        self.wait_for(lambda: self.subagent_threads(sid) and self.subagent_threads(sid)[0]["status"] == "running", 20)
+        self.c.call("chat.stop", {"session_id": sid, "branch_id": main_bid})
+        self.wait_for(lambda: self.summary(sid)["status"] == "idle", 10)
+        time.sleep(0.5)
+        self.assertEqual(self.results(sid), [])
 
 
 if __name__ == "__main__":

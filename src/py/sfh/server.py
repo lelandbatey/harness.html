@@ -15,7 +15,7 @@ import urllib.parse
 
 from tremolo import Application
 
-from . import about, agent as agentmod, branches, commands, common, creds as credsmod, htmlfile, llm, pty_ws, skills
+from . import about, agent as agentmod, branches, commands, common, creds as credsmod, htmlfile, llm, pty_ws, skills, subsessions
 from .store import Store, set_token as store_set_token
 
 CORS_HEADERS = {"Access-Control-Allow-Headers": "content-type, x-sfh-path, x-sfh-token",
@@ -254,6 +254,8 @@ class Server:
         if method == "sessions.list":
             return a.list()
         if method == "sessions.create":
+            if p.get("parent_id"):  # a subsession: the parent's cwd, provider and model
+                return subsessions.create(a, p["parent_id"], client)
             s = a.create(p.get("cwd"))
             self.onboarding_changed()
             return s

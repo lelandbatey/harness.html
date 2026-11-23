@@ -716,6 +716,7 @@ FLAKY_RE = re.compile(r"\[\[flaky:(\d+)\]\]")      # the first N attempts fail m
 TOOL_RE = re.compile(r"\[\[tool:(\w+):(\{.*?\})\]\]", re.S)  # any tool call with a JSON input
 SUBAGENT_RE = re.compile(r"\[\[subagent:((?:[^\[\]]|\[\[[^\[\]]*\]\])*)\]\]", re.S)  # allows one nested [[..]]
 FORK_RE = re.compile(r"\[\[fork:((?:[^\[\]]|\[\[[^\[\]]*\]\])*)\]\]", re.S)          # forked subagent thread
+NEST_RE = re.compile(r"\[\[nest:(\d+)(:slow)?\]\]")  # a chain of N nested subagents (the last one slow if :slow)
 
 
 class MockStream:
@@ -773,7 +774,10 @@ class MockStream:
             m = BASH_RE.search(trigger_text)
             calls = [("bash", {"command": m.group(1)})] if m else [
                 ("spawn", {"description": "mock task", "prompt": p, "context": "fresh"}) for p in SUBAGENT_RE.findall(trigger_text)] + [
-                ("spawn", {"description": "mock fork", "prompt": p, "context": "fork"}) for p in FORK_RE.findall(trigger_text)]
+                ("spawn", {"description": "mock fork", "prompt": p, "context": "fork"}) for p in FORK_RE.findall(trigger_text)] + [
+                ("spawn", {"description": "mock nest %s" % n, "context": "fresh",
+                           "prompt": "[[nest:%d%s]]" % (int(n) - 1, sl) if int(n) > 1 else "leaf" + (" [[slow]]" if sl else "")})
+                for n, sl in NEST_RE.findall(trigger_text) if int(n) > 0]
             if not calls:
                 calls = [(n, json.loads(j)) for n, j in TOOL_RE.findall(trigger_text)]
             if calls:

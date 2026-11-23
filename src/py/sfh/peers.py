@@ -362,7 +362,7 @@ class Hub:
             raise tools.ToolError("no session %s (see `peers` for active sessions)" % to)
         if not self.can_message(sid, to):
             raise tools.ToolError("%s works in another repository; you can only message sessions in this "
-                                  "repository or your parent/subagents" % to)
+                                  "repository or your parent/subsessions" % to)
         if kind not in KINDS:
             kind = "reply" if reply_to else ("question" if "?" in text else "info")
         msg = {"id": "pm_" + os.urandom(4).hex(), "from": sid, "from_title": self.title(sid), "to": to,
@@ -388,10 +388,10 @@ class Hub:
         return status
 
     def may_wake(self, sid):
-        """An idle session may be started by a peer question: subagents only (top-level sessions belong to
-        the user), within the wake limit."""
+        """An idle session may be started by a peer question: (old) subagent sessions only (top-level sessions
+        and subsessions belong to the user), within the wake limit."""
         row = self.session_row(sid)
-        if not row or not row[4]:
+        if not row or not row[4] or row[3] != "subagent":
             return False
         return self.under_limit(sid)
 
@@ -432,9 +432,13 @@ class Hub:
     def sessions_block(self, sid):
         """A <peer-sessions> block when the set of active peers changed since the session last saw it."""
         rt = self.rt(sid)
-        # only peers that can conflict: running, or holding claims / recent edits; a session's own parent and
-        # children are known to it already (the `peers` tool lists everyone)
-        peers = [p for p in self.peers_of(sid) if p["relation"] not in ("parent", "child")
+        # only peers that can conflict: running, or holding claims / recent edits; a session's own (old) subagent
+        # parent and children are known to it already (the `peers` tool lists everyone). Subsessions are separate
+        # conversations of the user that can conflict like any other session.
+        me = self.session_row(sid)
+        own = lambda p: ((p["relation"] == "child" and p["kind"] == "subagent")
+                         or (p["relation"] == "parent" and me and me[3] == "subagent"))
+        peers = [p for p in self.peers_of(sid) if not own(p)
                  and (p["status"] == "running" or p["claims"] or p["edited"])]
         sig = tuple(sorted(p["session_id"] for p in peers))
         if sig == rt.peer_sig or (rt.peer_sig is None and not sig):

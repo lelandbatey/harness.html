@@ -296,7 +296,7 @@ await waitFor(p1, () => (document.querySelector(".chat-foot .session-ctx")?.text
 step("context gauge; /compact shows a summary card");
 
 // 9b. subagent threads (v17): the spawn card links to the child thread, its <thread-message> report comes back
-// as a card, and the sidebar tree lists the thread under the session (below a pinned ★ main entry)
+// as a card, and the sidebar tree lists the subagent thread under the session row (which is the main thread)
 await p1.bringToFront();
 await typeInto(p1, ".composer textarea", "[[subagent:child task here]]");
 await p1.keyboard.press("Enter");
@@ -315,13 +315,14 @@ const srEdit = await p1.evaluate(() => [...document.querySelectorAll(".msgs .msg
   [...document.querySelectorAll(".msgs .msg.user .bubble")].some((b) => b.textContent.includes("<thread-message")));
 if (srEdit) await fail("subagent report rendered as an editable user bubble");
 await waitFor(p1, () => !document.querySelector(".chat-head .badge.running"), "parent idle after the report turn", 15000);
-await waitFor(p1, (s, b, r) => document.querySelector('#sb-list li.thread-item:not(.pinned-main) a[data-sid="' + s + '"][data-bid="' + b + '"]') &&
-  document.querySelector('#sb-list li.pinned-main a[data-sid="' + s + '"][data-bid="' + r + '"]'), "child thread + pinned main entry in the sidebar tree", 8000, sid, childBid, rootBid);
+await waitFor(p1, (s, b, r) => document.querySelector('#sb-list li.thread-item a[data-sid="' + s + '"][data-bid="' + b + '"]') &&
+  document.querySelector('#sb-list li:not(.thread-item) > a[data-sid="' + s + '"][data-main-bid="' + r + '"]') &&
+  !document.querySelector('#sb-list a[data-sid="' + s + '"][data-bid="' + r + '"]'), "subagent thread under the session (= main) row in the sidebar tree", 8000, sid, childBid, rootBid);
 await p1.evaluate((p) => document.querySelector('#sb-list a[data-sid="' + p + '"]:not([data-bid])').parentElement.querySelector(".tree-tog").click(), sid);
 await waitFor(p1, (s, b) => !document.querySelector('#sb-list a[data-sid="' + s + '"][data-bid="' + b + '"]'), "collapse hides the threads", 5000, sid, childBid);
 await p1.evaluate((p) => document.querySelector('#sb-list a[data-sid="' + p + '"]:not([data-bid])').parentElement.querySelector(".tree-tog").click(), sid);
 await waitFor(p1, (s, b) => document.querySelector('#sb-list a[data-sid="' + s + '"][data-bid="' + b + '"]'), "expand shows the threads", 5000, sid, childBid);
-step("subagent thread: spawn card link, report card, sidebar thread tree with pinned main");
+step("subagent thread: spawn card link, report card, sidebar tree of main + subagents");
 
 // 9b2. spatial view (v18): children on the right / the parent on the left, beside their fork message; the mode
 // follows the free width (full preview card, title, node with a hover card), the parent degrading first
@@ -361,16 +362,16 @@ await waitFor(p1, (r) => document.querySelector(".msgs > .inherited:not([hidden]
   "expanded inherited history keeps the parent link", 5000, rootBid);
 await waitFor(p1, async (s, b) => (await window.SFHApp.rpc("branches.list", { session_id: s })).branches.find((x) => x.id === b)?.expanded === true,
   "expanded state stored on the thread", 5000, sid, asideBid);
-// ★ main is a tag: promoting moves the pinned entry and the star, nothing else; then move it back
+// ★ main is a tag: promoting moves the session row's target and the star, nothing else; then move it back
 const threadKinds = (s) => p1.evaluate(async (i) => (await window.SFHApp.rpc("branches.list", { session_id: i })).branches.map((b) => b.id + ":" + b.kind).join(","), s);
 const kinds0 = await threadKinds(sid);
 await p1.evaluate(() => [...document.querySelectorAll(".branch-origin-div button")].find((b) => /Set as main/.test(b.textContent)).click());
-await waitFor(p1, (s, b) => document.querySelector('#sb-list li.pinned-main a[data-sid="' + s + '"][data-bid="' + b + '"]') &&
-  /★/.test(document.querySelector(".chat-head .branch-btn")?.textContent || ""), "promoted aside: pinned ★ entry + header star", 8000, sid, asideBid);
+await waitFor(p1, (s, b) => document.querySelector('#sb-list a[data-sid="' + s + '"][data-main-bid="' + b + '"]') &&
+  /★/.test(document.querySelector(".chat-head .branch-btn")?.textContent || ""), "promoted aside: session row opens it + header star", 8000, sid, asideBid);
 const kinds1 = await threadKinds(sid);
 if (kinds1 !== kinds0 || !/:aside$/.test(kinds1)) await fail("promotion changed thread kinds/order: " + kinds0 + " -> " + kinds1);
 await p1.evaluate((s, r) => window.SFHApp.rpc("branches.promote", { session_id: s, branch_id: r }), sid, rootBid);
-await waitFor(p1, (s, r) => document.querySelector('#sb-list li.pinned-main a[data-sid="' + s + '"][data-bid="' + r + '"]'), "main tag back on the root", 8000, sid, rootBid);
+await waitFor(p1, (s, r) => document.querySelector('#sb-list a[data-sid="' + s + '"][data-main-bid="' + r + '"]'), "main tag back on the root", 8000, sid, rootBid);
 // more than 2 threads at one message: 2 stacked + "+N" expanding in place
 const forkAt = await p1.evaluate(() => { const c = window.SFHApp.current, a = c.branches.branches.find((b) => b.id === c.branchId); return a.origin_id; });
 await p1.evaluate(async (s, r, at) => {

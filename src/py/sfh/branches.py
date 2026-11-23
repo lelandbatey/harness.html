@@ -20,6 +20,8 @@ from . import llm, peers, skills, tools
 from .store import now_ms
 
 PROMOTE_PROMPTS = 3  # user prompts on an aside before it auto-promotes past an older main
+MAX_SUBAGENT_DEPTH = 5       # subagents may spawn subagents, down to this many levels below a non-subagent thread
+MAX_RUNNING_SUBAGENTS = 50   # subagent threads running at once, across all sessions of this server
 
 BRANCH_COLS = ("id, session_id, name, origin_id, head_id, kind, created_at, updated_at, "
                "parent_branch_id, spawned_at_id, context_mode, expanded")
@@ -36,6 +38,14 @@ SUBAGENT_SYSTEM_NOTE = (
     "Work on it autonomously (nobody can answer interactive questions). Your final message is returned verbatim "
     "to the parent thread, so make it a complete, self-contained report of what you found or did."
 )
+SUBAGENT_SPAWN_NOTE = (
+    "You are at subagent depth %d of at most %d. You may `spawn` subagents of your own for independent parts of "
+    "a large task that can run in parallel; don't for small tasks. Their reports arrive later as <thread-message> "
+    "user messages. You may end your turn while they run: your report goes to your parent only once none of your "
+    "subagents is running any more, so make your final message after the last report the complete one."
+)
+SUBAGENT_LEAF_NOTE = ("You are at the maximum subagent depth (%d), so you cannot spawn subagents yourself: "
+                      "do the whole task in this thread.")
 
 
 def _new_id():
@@ -172,6 +182,34 @@ def is_subagent_branch(store, sid, bid):
         return False
     row = get_row(store, sid, bid)
     return bool(row and row[5] == "subagent")
+
+
+def subagent_depth(store, sid, bid):
+    """How many subagent levels `bid` is below a non-subagent thread (0 for root/aside/edit threads)."""
+    depth, seen = 0, set()
+    while bid and bid not in seen:
+        seen.add(bid)
+        row = store.query_one("SELECT kind, parent_branch_id FROM branches WHERE session_id=? AND id=?", (sid, bid))
+        if not row or row[0] != "subagent":
+            break
+        depth += 1
+        bid = row[1]
+    return depth
+
+
+def subagent_children(store, sid, bid):
+    """Ids of the subagent threads `bid` spawned."""
+    return [r[0] for r in store.query("SELECT id FROM branches WHERE session_id=? AND parent_branch_id=? "
+                                      "AND kind='subagent' AND id != ?", (sid, bid, bid))]
+
+
+def running_subagents(agent):
+    """Number of subagent threads running right now, across all sessions."""
+    running = [bid for bid in list(agent.brt) if agent.branch_running(bid)]
+    if not running:
+        return 0
+    return agent.store.query_one("SELECT COUNT(*) FROM branches WHERE kind='subagent' AND id IN (%s)"
+                                 % ",".join("?" * len(running)), running)[0]
 
 
 def head_of(store, sid, bid=None):
@@ -1110,7 +1148,10 @@ def system_note(agent, sid, current_bid=None):
     cur = next((b for b in info["branches"] if b["id"] == cur_bid), None)
     parts = []
     if cur and cur["kind"] == "subagent":
-        parts.append(SUBAGENT_SYSTEM_NOTE)
+        depth = subagent_depth(agent.store, sid, cur_bid)
+        parts.append(SUBAGENT_SYSTEM_NOTE + "\n\n" + (SUBAGENT_SPAWN_NOTE % (depth, MAX_SUBAGENT_DEPTH)
+                                                       if depth < MAX_SUBAGENT_DEPTH else
+                                                       SUBAGENT_LEAF_NOTE % MAX_SUBAGENT_DEPTH))
     others = [b for b in info["branches"]
               if b["id"] != cur_bid and b["kind"] in ("root", "aside", "subagent")
               and (b["own_messages"] > 0 or b["status"] == "running")]
@@ -1166,8 +1207,8 @@ def threads_text(agent, sid, current_bid=None):
 
 
 def tool_defs(store, sid, bid=None):
-    """Tools exposed to the model on `(sid, bid)`. Subagent threads cannot recursively `spawn`."""
-    if is_subagent_branch(store, sid, bid):
+    """Tools exposed to the model on `(sid, bid)`: no `spawn` at the maximum subagent depth."""
+    if bid and subagent_depth(store, sid, bid) >= MAX_SUBAGENT_DEPTH:
         return [d for d in tools.DEFINITIONS if d["name"] != "spawn"]
     return tools.DEFINITIONS
 
@@ -1178,8 +1219,12 @@ async def spawn(agent, sid, current_bid, description, prompt, context="fresh"):
     prompt = str(prompt or "").strip()
     if not prompt:
         raise tools.ToolError("prompt is required")
-    if is_subagent_branch(agent.store, sid, current_bid):
-        raise tools.ToolError("subagents are not available here (subagent threads cannot spawn subagents)")
+    if subagent_depth(agent.store, sid, current_bid) >= MAX_SUBAGENT_DEPTH:
+        raise tools.ToolError("subagents are not available here: the maximum subagent depth (%d) is reached; "
+                              "do the task in this thread" % MAX_SUBAGENT_DEPTH)
+    if running_subagents(agent) >= MAX_RUNNING_SUBAGENTS:
+        raise tools.ToolError("too many subagents are running (at most %d at once); wait for some of yours to "
+                              "finish, or do the task in this thread" % MAX_RUNNING_SUBAGENTS)
     context = str(context or "fresh").strip().lower()
     if context not in ("fresh", "fork"):
         raise tools.ToolError("context must be 'fresh' or 'fork'")
@@ -1309,23 +1354,33 @@ def final_text(agent, sid, bid):
     return ""
 
 
-def turn_finished(agent, sid, bid, rt, error=None):
-    """When a thread turn started by `spawn` or `message` finishes, deliver <thread-message> back."""
+def turn_finished(agent, sid, bid, rt, error=None, stopped=False):
+    """When a thread turn started by `spawn` or `message` finishes, deliver <thread-message> back.
+
+    A subagent also reports to its parent thread again after a later run started by the report of one of its
+    own subagents (not after runs started by other threads or peers). While any of those still runs (and it
+    wasn't stopped or failed), it doesn't report yet (`rt.awaiting`): the report follows the run that handles
+    the last one, or comes from `stopped=True` when it is stopped while waiting."""
     caller_bid = getattr(rt, "notify_branch", None)
+    suppressed, rt.suppress_notify = rt.suppress_notify, False
     if not caller_bid:
         return
-    rt.notify_branch = None
-    if not get_row(agent.store, sid, caller_bid):
-        return
     row = get_row(agent.store, sid, bid)
-    title = getattr(rt, "sub_description", None) or (row[2] if row else "") or bid
     kind = (row[5] if row else None) or "aside"
-    if rt.cancel is not None and rt.cancel.is_set():
+    if stopped or (rt.cancel is not None and rt.cancel.is_set()):
         status = "stopped"
     elif error is not None:
         status = "error"
     else:
         status = "completed"
+    rt.awaiting = status == "completed" and kind == "subagent" and any(
+        agent.branch_running(k) for k in subagent_children(agent.store, sid, bid))
+    if rt.awaiting:
+        return
+    rt.notify_branch = None
+    if suppressed or not get_row(agent.store, sid, caller_bid):
+        return
+    title = getattr(rt, "sub_description", None) or (row[2] if row else "") or bid
     text = final_text(agent, sid, bid)
     if status == "error" and error is not None:
         text = (text + "\n\n" if text else "") + "Error: %s" % error
@@ -1333,8 +1388,15 @@ def turn_finished(agent, sid, bid, rt, error=None):
         quoteattr(bid), quoteattr(title), quoteattr(kind), quoteattr(status), text)
 
     async def deliver():
-        if agent.summary(sid) and get_row(agent.store, sid, caller_bid):
-            await agent.send(sid, msg, branch_id=caller_bid, from_branch=True)
+        crow = get_row(agent.store, sid, caller_bid)
+        if not agent.summary(sid) or not crow:
+            return
+        if kind == "subagent" and row[8] == caller_bid and crow[5] == "subagent" and crow[8] and crow[8] != caller_bid:
+            # a nested subagent reports to its parent subagent: the run this starts there reports up again
+            crt = agent.branch_rt(caller_bid)
+            if crt.notify_branch is None:
+                crt.notify_branch = crow[8]
+        await agent.send(sid, msg, branch_id=caller_bid, from_branch=True)
     agent.spawn(deliver())
 
 

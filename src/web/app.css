@@ -609,8 +609,6 @@ a.local-missing { color: inherit; text-decoration: line-through dotted; text-dec
 .inherit-bar .ib-act { margin-left: auto; color: var(--accent); font-size: 12px; }
 .bm-star, .sb-list .th-star { color: #d4a017; }
 .sb-list .th-star { font-size: 10px; flex: none; }
-.sb-list li.pinned-main > a { color: var(--fg-soft); }
-.sb-list li.pinned-main .th-ico { color: #d4a017; }
 
 /* spatial view (v18): parent thread on the left, child threads on the right of the conversation, beside their
    fork message. Not columns: floating previews in the free space, degrading to titles, then to dots. */

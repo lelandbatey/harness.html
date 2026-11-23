@@ -6,7 +6,7 @@ import os
 import re
 import threading
 
-from . import branches, links, llm, peers, signals, skills, subagents, tools
+from . import branches, links, llm, peers, signals, skills, subsessions, tools
 from .store import now_ms
 
 MAX_ITERATIONS = 300   # unattended LLM calls (tool loop iterations) per user message
@@ -153,11 +153,12 @@ class BranchRuntime:
         self.cancel = None       # asyncio.Event for the running turn
         self.tool_ctx = None
         self.btw_tasks = set()
-        self.prompted = False    # the current run had a real prompt (not only a peer wake)
         self.tools = {}          # tool_use id -> {"started_at", "ended_at"?} of the current step's tool runs
         self.sub_error = None
         self.title_gen = 0
         self.notify_branch = None  # branch id waiting for this branch's result (message_branch)
+        self.suppress_notify = False  # stopped along with its parent thread: don't report back
+        self.awaiting = False    # an idle subagent waiting for its own subagents before it reports
 
 
 class Agent:
@@ -253,7 +254,7 @@ class Agent:
                     "active_branch_id": main_bid, "active_branch_name": bname, "active_branch_kind": bkind,
                     "branch_count": len(b_rows),
                     "threads": branches.compact_threads(self, sid),
-                    "message_count": count}, **subagents.info(self.store, sid))
+                    "message_count": count}, **subsessions.info(self.store, sid))
         out.update(self.peers.summary_fields(sid, row[2]))
         if perr:
             out["provider_error"] = perr
@@ -264,13 +265,16 @@ class Agent:
             out.update({"effort": eff, "effort_wanted": wanted, "effort_override": row[8],
                         "efforts": info["efforts"] if info["efforts"] is not None else list(llm.DEFAULT_EFFORTS),
                         "efforts_known": info["efforts"] is not None})
-        kids = [r[0] for r in self.store.query("SELECT usage FROM sessions WHERE parent_id=? AND usage IS NOT NULL",
-                                               (sid,))]
-        if kids:
-            total = None
-            for k in kids:
-                total = merge_usage(total, json.loads(k))
-            out["usage_subagents"] = total
+        total, todo, seen = None, [sid], {sid}
+        while todo:  # all descendant sessions (subsessions of subsessions too)
+            for kid, u in self.store.query("SELECT id, usage FROM sessions WHERE parent_id=?", (todo.pop(),)):
+                if kid not in seen:
+                    seen.add(kid)
+                    todo.append(kid)
+                    if u:
+                        total = merge_usage(total, json.loads(u))
+        if total:
+            out["usage_subsessions"] = total
         return out
 
     # --- usage / cost --------------------------------------------------------------------------
@@ -298,9 +302,14 @@ class Agent:
             total = llm.add_usage(self.usage(sid), u)
             self.store.execute("UPDATE sessions SET usage=? WHERE id=?", (json.dumps(total), sid))
         self.updated(sid)
-        parent = self.store.query_one("SELECT parent_id FROM sessions WHERE id=?", (sid,))
-        if parent and parent[0]:
-            self.updated(parent[0])
+        seen = {sid}
+        while True:  # ancestors show the cost of their subsessions
+            parent = self.store.query_one("SELECT parent_id FROM sessions WHERE id=?", (sid,))
+            if not parent or not parent[0] or parent[0] in seen:
+                break
+            sid = parent[0]
+            seen.add(sid)
+            self.updated(sid)
 
     def list(self):
         ids = [r[0] for r in self.store.query("SELECT id FROM sessions ORDER BY updated_at DESC")]
@@ -422,7 +431,10 @@ class Agent:
         self.require(sid)
         bids = [r[0] for r in self.store.query("SELECT id FROM branches WHERE session_id=?", (sid,))]
         await self.stop_all(sid)
+        kids = [r[0] for r in self.store.query("SELECT id FROM sessions WHERE parent_id=?", (sid,))]
         with self.store.lock:
+            # its subsessions outlive it as top-level sessions
+            self.store.execute("UPDATE sessions SET parent_id=NULL WHERE parent_id=?", (sid,))
             self.store.execute("DELETE FROM branches WHERE session_id=?", (sid,))
             self.store.execute("DELETE FROM messages WHERE session_id=?", (sid,))
             self.store.execute("DELETE FROM sessions WHERE id=?", (sid,))
@@ -431,6 +443,8 @@ class Agent:
         self.rt.pop(sid, None)
         self.peers.forget(sid)
         self.server.broadcast("session.deleted", {"session_id": sid})
+        for k in kids:
+            self.updated(k)
 
     def head(self, sid, branch_id=None):
         if branch_id is not None:
@@ -557,8 +571,8 @@ class Agent:
 
     def system_prompt(self, sid, branch_id=None):
         s = self.require(sid)
-        return skills.system_prompt(self.settings(), s["cwd"], self.server.html_path) + branches.system_note(
-            self, sid, branch_id)
+        return (skills.system_prompt(self.settings(), s["cwd"], self.server.html_path)
+                + subsessions.system_note(self.store, sid) + branches.system_note(self, sid, branch_id))
 
     # --- chat ----------------------------------------------------------------------------------
 
@@ -610,10 +624,19 @@ class Agent:
         self.updated(sid)
         return True
 
-    async def stop_branch(self, sid, bid):
+    async def stop_branch(self, sid, bid, cascade=True):
+        """Stops a thread; with `cascade`, first the subagents it spawned (and theirs, recursively), whose
+        results are then not delivered (to a thread that is being stopped anyway)."""
+        if cascade:
+            for kid in branches.subagent_children(self.store, sid, bid):
+                if self.branch_running(kid) or (kid in self.brt and self.brt[kid].awaiting):
+                    self.brt[kid].suppress_notify = True
+                await self.stop_branch(sid, kid)
         brt = self.brt.get(bid)
         if not brt:
             return
+        if brt.awaiting and not self.branch_running(bid):  # its report was waiting for the subagents just stopped
+            branches.turn_finished(self, sid, bid, brt, stopped=True)
         if brt.queue:
             brt.queue.clear()
             self.server.emit(sid, "queue.updated", {"session_id": sid, "branch_id": bid, "queue": []})
@@ -637,8 +660,11 @@ class Agent:
 
     async def stop_all(self, sid):
         bids = [r[0] for r in self.store.query("SELECT id FROM branches WHERE session_id=?", (sid,))]
+        for bid in bids:  # every thread stops: nobody is left to report to
+            if self.branch_running(bid) or (bid in self.brt and self.brt[bid].awaiting):
+                self.brt[bid].suppress_notify = True
         for bid in bids:
-            await self.stop_branch(sid, bid)
+            await self.stop_branch(sid, bid, cascade=False)
 
     async def edit(self, sid, message_id, text, branch_id=None):
         self.require(sid)
@@ -691,7 +717,7 @@ class Agent:
             prompt = COMPACT_PROMPT + ("\n\nAdditional instructions from the user: " + instructions
                                        if instructions else "")
             system = skills.system_prompt(settings, session["cwd"], self.server.html_path)
-            system += subagents.system_note(self.store, sid)
+            system += subsessions.system_note(self.store, sid)
             stream = llm.retrying_stream(settings, provider, self.server.creds, model, system,
                                          history + [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
                                          None, settings["max_tokens"], 0)
@@ -734,7 +760,6 @@ class Agent:
         """text None: a wake by a peer question (only the inbox is delivered)."""
         bid = branch_id or self.active_branch(sid)
         rt = self.brt[bid]
-        rt.prompted = False
         first_exchange = False
         first_aside_exchange = False
         try:
@@ -754,7 +779,6 @@ class Agent:
                         break
                     first = False
                 else:
-                    rt.prompted = True
                     self.add_message(sid, "user", [{"type": "text", "text": text}], branch_id=bid)
                     if aside_first:
                         first_aside_exchange = True
@@ -792,8 +816,6 @@ class Agent:
                     break
         finally:
             branches.turn_finished(self, sid, bid, rt, getattr(rt, "sub_error", None))
-            if rt.prompted:  # a turn only answering peers doesn't report back to the parent
-                subagents.turn_finished(self, sid, rt, getattr(rt, "sub_error", None))
             rt.sub_error = None
             rt.cancel = None
             rt.stream = None
@@ -820,7 +842,7 @@ class Agent:
             provider, model = self.session_llm(sid, settings)
             _, effort, einfo = self.session_effort(sid, provider["id"], model, settings)
             system = skills.system_prompt(settings, session["cwd"], self.server.html_path)
-            system += subagents.system_note(self.store, sid)
+            system += subsessions.system_note(self.store, sid)
             system += branches.system_note(self, sid, bid)
             started = now_ms()
             stream = llm.retrying_stream(settings, provider, self.server.creds, model, system,
@@ -857,7 +879,6 @@ class Agent:
                 return
             rt.tool_ctx = tools.Context(session["cwd"], lambda n, c=session["cwd"]: skills.load(
                 n, c, self.settings(), self.server.html_path))
-            subagents.attach(self, sid, rt.tool_ctx, loop)
             rt.tool_ctx.peer = peers.ToolBridge(self.peers, sid, loop)
             rt.tool_ctx.branch = branches.ToolBridge(self, sid, bid, loop)
             results = []

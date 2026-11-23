@@ -141,7 +141,12 @@ This harness runs in server mode with an HTTP/websocket API, and has two clients
     subagents, or ask them one-shot questions like users can with `/btw`
   - Agents are encouraged not to read the whole branches off to the side, only look at metadata and
     to ask the user if they should check in, or if the user proactively tells them to look.
-- Agents in a session can launch sub agents
+  - A user can create a new thread with an empty context but in the same directory as the current
+    session with `/subsession`; it's like a new session, but it "belongs to" a parent session (like
+    a subagent belongs to a parent session). Subsessions are handled different from subagents in
+    that subsessions are meant to host full back-and-forth conversations with the user.
+- Agents in a session can launch sub agents. Sub-agents are also agents, so can also start
+  sub-agents. Depth limit is 5 deep. Max total sub-agents running at once 50
 - Agents can communicate with other running agents in order to negotiate locks, priorities, ask
   questions, etc
 - Durations for messages in a session indicate how long they took to run; how long thinking tokens

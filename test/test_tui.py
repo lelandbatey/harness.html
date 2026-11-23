@@ -417,7 +417,7 @@ class SubagentRenderTests(unittest.TestCase):
         self.assertIn("  ↳ grandkid", out[2])
         p = tui.SessionPicker(lst, now_ms=0)
         rows = plain(p.render(80, 6))
-        self.assertTrue(rows[1].startswith("❯ parent") and "1 subagent" in rows[1], rows)
+        self.assertTrue(rows[1].startswith("❯ parent") and "1 subsession" in rows[1], rows)
         self.assertTrue(rows[2].startswith("  ↳ kid task"), rows)
         self.assertTrue(rows[3].startswith("    ↳ grandkid"), rows)
         p.handle("down")
@@ -680,7 +680,7 @@ class UsageContextCompactionTests(unittest.TestCase):
     def test_labels(self):
         s = {"usage": {"calls": 2, "priced_calls": 2, "cost": 0.5, "input_tokens": 1000, "cache_read_tokens": 500,
                        "output_tokens": 200},
-             "usage_subagents": {"calls": 1, "priced_calls": 0, "cost": 0, "input_tokens": 100, "output_tokens": 50},
+             "usage_subsessions": {"calls": 1, "priced_calls": 0, "cost": 0, "input_tokens": 100, "output_tokens": 50},
              "context": {"used": 45200, "window": 200000, "estimated": False}}
         self.assertEqual(tui.usage_label(s), "$0.50+ · 1.6k in · 250 out")
         self.assertEqual(tui.usage_label({}), "")

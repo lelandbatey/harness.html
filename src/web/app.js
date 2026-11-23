@@ -337,6 +337,9 @@
         }
         if (S.route && S.route.name === "sessions") renderSessionsGrid();
         break;
+      case "session.open":  // e.g. /subsession: this tab switches to the new session
+        location.hash = "#session/" + encodeURIComponent(d.session_id);
+        break;
       case "session.deleted":
         S.sessions.delete(d.session_id);
         renderSidebar();
@@ -572,6 +575,11 @@
     }
     return roots.map(function (s) { return node(s, []); });
   }
+  // "2 subsessions" (child sessions; "subagents" when all are child sessions from older versions)
+  function kidsLabel(kids) {
+    var word = kids.length && kids.every(function (k) { return (k.s || k).kind === "subagent"; }) ? "subagent" : "subsession";
+    return kids.length + " " + word + (kids.length === 1 ? "" : "s");
+  }
   function treeCollapsed(id) { return !!(LS.get("collapsed", {}) || {})[id]; }
   function toggleTree(id) {
     var m = LS.get("collapsed", {}) || {};
@@ -613,60 +621,84 @@
     return "⑂";
   }
 
-  function treeToggle(n) {
-    var threads = (n.s.threads && n.s.threads.length > 1) ? n.s.threads : [];
-    var count = n.kids.length + (threads.length > 1 ? threads.length : 0);
-    if (!count) return null;
-    var closed = treeCollapsed(n.s.id);
-    var what = threads.length > 1 ? threads.length + " threads" : n.kids.length + " subagent" + (n.kids.length === 1 ? "" : "s");
+  // Sidebar tree (v19): one row per session, which *is* its main thread; under it only the subagent threads
+  // (nested by spawning subagent) and the subsessions. Forks/asides/edits live in the graph minimap instead.
+  function sidebarSubagents(s) {
+    var list = s.threads || [];
+    var byId = new Map(list.map(function (t) { return [t.id, t]; }));
+    var kids = new Map(), top = [];
+    list.forEach(function (t) {
+      if (t.kind !== "subagent" || t.is_main) return;
+      var p = byId.get(t.parent_branch_id), seen = new Set([t.id]);
+      while (p && p.kind !== "subagent" && !seen.has(p.id)) { seen.add(p.id); p = byId.get(p.parent_branch_id); }
+      if (p && p.kind === "subagent" && !p.is_main && p.id !== t.id) {
+        if (!kids.has(p.id)) kids.set(p.id, []);
+        kids.get(p.id).push(t);
+      } else top.push(t);
+    });
+    function node(t, seen) {
+      seen = new Set(seen).add(t.id);
+      return { t: t, kids: (kids.get(t.id) || []).filter(function (k) { return !seen.has(k.id); }).map(function (k) { return node(k, seen); }) };
+    }
+    return top.map(function (t) { return node(t, []); });
+  }
+  function countSubagents(nodes) { return nodes.reduce(function (a, n) { return a + 1 + countSubagents(n.kids); }, 0); }
+
+  function treeToggle(key, what) {
+    if (!what) return null;
+    var closed = treeCollapsed(key);
     return el("button", { class: "tree-tog", type: "button", title: (closed ? "Show " : "Hide ") + what,
       "aria-expanded": closed ? "false" : "true", text: closed ? "▸" : "▾",
-      onclick: function (e) { e.preventDefault(); e.stopPropagation(); toggleTree(n.s.id); } });
+      onclick: function (e) { e.preventDefault(); e.stopPropagation(); toggleTree(key); } });
   }
+  function plural(n, w) { return n + " " + w + (n === 1 ? "" : "s"); }
 
   function renderSidebar() {
     var ul = $("#sb-list");
     var activeId = S.route && S.route.name === "session" ? S.route.id : null;
     var activeBid = cur && cur.id === activeId ? cur.branchId : (S.route && S.route.bid);
     ul.textContent = "";
+    function addThread(s, n, depth, cmap) {
+      var t = n.t, key = s.id + "/" + t.id;
+      var href = "#session/" + encodeURIComponent(s.id) + "/" + encodeURIComponent(t.id);
+      var tip = t.name + " (subagent · " + (t.context_mode || "fresh") + ")";
+      var ta = el("a", { href: href, class: s.id === activeId && activeBid === t.id ? "active" : null, title: tip,
+          "data-sid": s.id, "data-bid": t.id },
+        el("span", { class: "th-ico", style: "--lane-color:" + laneColor(cmap.get(t.id) || 0), text: threadGlyph(t) }),
+        el("span", { class: "t", text: t.name }),
+        el("span", { class: "th-tag", text: t.context_mode === "fresh" ? "sub" : "fork" }),
+        t.status === "running" ? el("span", { class: "status-dot", title: "running" }) : null);
+      ul.append(el("li", { class: "thread-item", style: "--depth:" + depth },
+        treeToggle(key, n.kids.length ? plural(countSubagents(n.kids), "subagent") : null), ta));
+      if (!treeCollapsed(key)) n.kids.forEach(function (k) { addThread(s, k, Math.min(depth + 1, 8), cmap); });
+    }
     function add(n, depth) {
       var s = n.s;
-      var threads = s.threads && s.threads.length > 1 ? s.threads : [];
-      var a = el("a", { href: "#session/" + encodeURIComponent(s.id), title: titleOf(s) + (s.cwd ? "\n" + s.cwd : ""),
-        class: s.id === activeId && !threads.length ? "active" : (s.id === activeId && !activeBid ? "active" : null), "data-sid": s.id },
+      var subs = sidebarSubagents(s);
+      var subIds = new Set();
+      (function collect(ns) { ns.forEach(function (x) { subIds.add(x.t.id); collect(x.kids); }); })(subs);
+      var nSub = countSubagents(subs);
+      var closed = treeCollapsed(s.id);
+      // the session row is the main thread: active unless one of its listed subagents is the current thread
+      var isActive = s.id === activeId && !(activeBid && subIds.has(activeBid));
+      var mainBid = s.main_branch_id;
+      var href = "#session/" + encodeURIComponent(s.id) + (mainBid && (s.branch_count || 0) > 1 ? "/" + encodeURIComponent(mainBid) : "");
+      var running = closed || !nSub ? s.status === "running" : (s.active_status || s.status) === "running";
+      var what = [nSub ? plural(nSub, "subagent") : "", n.kids.length ? kidsLabel(n.kids) : ""].filter(Boolean).join(", ");
+      var a = el("a", { href: href, title: titleOf(s) + (s.cwd ? "\n" + s.cwd : ""),
+          class: isActive ? "active" : null, "data-sid": s.id, "data-main-bid": mainBid || null },
         svgEl(iconSvg(s, 16)),
         el("span", { class: "t" + (s.title ? "" : " untitled"), text: titleOf(s) }),
-        n.kids.length ? el("span", { class: "kids-count", title: n.kids.length + " subagent" + (n.kids.length === 1 ? "" : "s"), text: String(n.kids.length) }) : null,
-        s.branch_count > 1 ? el("span", { class: "branch-count", title: s.branch_count + " threads", text: "⑂" + s.branch_count }) : null,
+        closed && what ? el("span", { class: "kids-count", title: what, text: String(nSub + n.kids.length) }) : null,
         inboxBadge(s), peerBadge(s),
-        s.status === "running" ? el("span", { class: "status-dot", title: "running" }) : null);
-      var li = el("li", { class: depth ? "child" : null, style: depth ? "--depth:" + depth : null }, treeToggle(n), a);
-      ul.append(li);
-      if (!treeCollapsed(s.id)) {
-        if (threads.length > 1) {
-          var cmap = branchLaneMap(threads);
-          var threadLink = function (t, d, pinned) {
-            var isCur = s.id === activeId && activeBid === t.id;
-            var col = laneColor(cmap.get(t.id) || 0);
-            var href = "#session/" + encodeURIComponent(s.id) + "/" + encodeURIComponent(t.id);
-            var tip = (pinned ? "Main thread: " : "") + t.name + " (" + t.kind + (t.kind === "subagent" ? " · " + (t.context_mode || "fresh") : "") +
-              (t.is_main ? ", ★ main" : "") + ")";
-            // the pinned duplicate is never marked current, so the tree shows where you are
-            var ta = el("a", { href: href, class: isCur && !pinned ? "active" : null, title: tip, "data-sid": s.id, "data-bid": t.id,
-                "data-pinned-main": pinned ? "1" : null },
-              el("span", { class: "th-ico", style: "--lane-color:" + col, text: pinned ? "★" : threadGlyph(t) }),
-              el("span", { class: "t", text: t.name }),
-              t.is_main && !pinned ? el("span", { class: "th-star", title: "main thread", text: "★" }) : null,
-              t.kind === "subagent" ? el("span", { class: "th-tag", text: t.context_mode === "fresh" ? "sub" : "fork" }) : null,
-              t.status === "running" ? el("span", { class: "status-dot", title: "running" }) : null);
-            ul.append(el("li", { class: "thread-item" + (pinned ? " pinned-main" : ""), style: "--depth:" + d }, ta));
-          };
-          var mainT = threads.find(function (t) { return t.is_main; });
-          if (mainT) threadLink(mainT, depth + 1, true);
-          orderThreadsTree(threads).ordered.forEach(function (item) { threadLink(item.b, depth + 1 + Math.min(3, item.depth), false); });
-        }
-        n.kids.forEach(function (k) { add(k, depth + 1); });
+        running ? el("span", { class: "status-dot", title: "running" }) : null);
+      ul.append(el("li", { class: depth ? "child" : null, style: depth ? "--depth:" + depth : null }, treeToggle(s.id, what), a));
+      if (closed) return;
+      if (subs.length) {
+        var cmap = branchLaneMap(s.threads || []);
+        subs.forEach(function (k) { addThread(s, k, depth + 1, cmap); });
       }
+      n.kids.forEach(function (k) { add(k, depth + 1); });
     }
     sessionTree(sortedSessions()).forEach(function (n) { add(n, 0); });
     if (!S.sessions.size) ul.append(el("li", { class: "muted small", style: "padding:6px 10px", text: "No sessions yet" }));
@@ -914,7 +946,7 @@
     append(h, [svgEl(iconSvg(s, 32)),
       el("div", { class: "info" }, titleBtn,
         el("div", { class: "chat-meta" },
-          s.parent_id ? el("span", { class: "sub-of" }, "subagent of ",
+          s.parent_id ? el("span", { class: "sub-of" }, (s.kind === "subagent" ? "subagent" : "subsession") + " of ",
             el("a", { class: "parent-link", href: "#session/" + encodeURIComponent(s.parent_id), text: parent ? titleOf(parent) : s.parent_id })) : null,
           s.cwd ? (S.offline ? el("span", { class: "cwd", title: s.cwd, text: tildify(s.cwd) })
             : el("button", { class: "cwd cwd-btn", type: "button", title: s.cwd + "\nClick to change this session's working directory",
@@ -1082,10 +1114,11 @@
   function updateCost(s) {
     updateContext(s);
     if (!cur || !cur.costEl) return;
-    var total = sumUsage(s.usage, s.usage_subagents);
+    var kidsU = s.usage_subsessions;
+    var total = sumUsage(s.usage, kidsU);
     cur.costEl.textContent = usageText(total);
-    cur.costEl.title = [usageTip(total, "Session total" + (s.usage_subagents ? " incl. subagents" : "")),
-      s.usage_subagents ? usageTip(s.usage, "This session") : "", usageTip(s.usage_subagents, "Subagents")].filter(Boolean).join("\n\n");
+    cur.costEl.title = [usageTip(total, "Session total" + (kidsU ? " incl. subsessions" : "")),
+      kidsU ? usageTip(s.usage, "This session") : "", usageTip(kidsU, "Subsessions")].filter(Boolean).join("\n\n");
   }
 
   function changeSessionCwd() {
@@ -2946,11 +2979,11 @@
           el("div", { class: "meta" },
             el("span", { title: s.updated_at ? new Date(s.updated_at).toLocaleString() : "", text: ago(s.updated_at) }),
             el("span", { text: "· " + (s.message_count || 0) + " message" + (s.message_count === 1 ? "" : "s") }),
-            kids ? el("span", { class: "kids-count", text: kids + " subagent" + (kids === 1 ? "" : "s") }) : null,
+            kids ? el("span", { class: "kids-count", text: kidsLabel(n.kids) }) : null,
             s.branch_count > 1 ? el("span", { class: "branch-count", text: "⑂" + s.branch_count + " branches" }) : null,
-            s.kind === "subagent" ? el("span", { class: "badge", text: "subagent" }) : null,
+            s.kind === "subagent" || s.kind === "subsession" ? el("span", { class: "badge", text: s.kind }) : null,
             s.status === "running" ? el("span", { class: "badge running", text: "running" }) : null)),
-        n && n.kids.length ? treeToggle(n) : null,
+        n && n.kids.length ? treeToggle(n.s.id, kidsLabel(n.kids)) : null,
         del);
     }
     if (q) list.forEach(function (s) { grid.append(card(s, null)); });

@@ -1022,7 +1022,7 @@ def relative_time(ms, now_ms):
 
 
 def nest_sessions(sessions):
-    """[(session, depth)] with subagent sessions right after (indented under) their parent, keeping the
+    """[(session, depth)] with child sessions (subsessions) right after (indented under) their parent, keeping the
     given order among siblings. Children of unknown parents stay at top level."""
     ids = {s.get("id") for s in sessions}
     kids = {}
@@ -1125,7 +1125,7 @@ class SessionPicker:
                                               s.get("message_count", 0), s.get("cwd") or "")
             title = tree_prefix(s.get("_depth", 0)) + (s.get("title") or "(untitled)")
             if s.get("children"):
-                meta += " · %d subagent%s" % (s["children"], "" if s["children"] == 1 else "s")
+                meta += " · %d subsession%s" % (s["children"], "" if s["children"] == 1 else "s")
             line = clip("%s  %s" % (title, meta), max(1, width - 2))
             if i == self.sel:
                 rows.append(REVERSE + "❯ " + line + " " * max(0, width - 2 - str_width(line)) + RESET)
@@ -1148,11 +1148,11 @@ def fmt_tokens(n):
 
 
 def usage_label(session):
-    """"$0.0123 · 12.3k in · 2.1k out" for a session summary (incl. subagents); "" before any response.
+    """"$0.0123 · 12.3k in · 2.1k out" for a session summary (incl. subsessions); "" before any response.
     The cost shows when the provider reported one or its price list gave one ("~": some of it is
     estimated from the price list; "+": some responses have no cost)."""
     total = {}
-    for u in (session.get("usage"), session.get("usage_subagents")):
+    for u in (session.get("usage"), session.get("usage_subsessions")):
         for k, v in (u or {}).items():
             total[k] = (total.get(k) or 0) + (v or 0)
     if not total.get("calls"):
@@ -1423,6 +1423,7 @@ class App:
         self.tlines_h = 10
         self.quit = False
         self.picker = None
+        self.pending_open = None  # session id the server asked this client to switch to (/subsession)
         self.hello = {}
         self.mouse = True        # mouse wheel scrolling wanted (setting tui_mouse, /mouse)
         self.term_active = False  # raw mode + alternate screen (+ mouse reporting) are on
@@ -1651,6 +1652,9 @@ class App:
             if d.get("id") == sid:
                 self.session = d
             return
+        if name == "session.open":
+            self.pending_open = d.get("session_id")
+            return
         if name == "session.deleted":
             if d.get("session_id") == sid:
                 self.items.append(("local", "This session was deleted by another client."))
@@ -1732,6 +1736,12 @@ class App:
         while self.rpc.has_pending():
             for ev in self.rpc.poll_events(0):
                 self.on_event(ev)
+        if self.pending_open:
+            sid, self.pending_open = self.pending_open, None
+            try:
+                self.open_session(sid)
+            except wsclient.RPCError as e:
+                self.flash = "opening subsession failed: %s" % e
         if self.setup is not None and not self.needs_setup():
             self.finish_setup()
 
