@@ -400,10 +400,31 @@ await p1.evaluate(() => { if (window.SFHApp.current.minimapExpanded) document.qu
 await waitFor(p1, () => document.querySelector(".branch-minimap.minimal:not([hidden])"), "minimal minimap", 5000);
 await p1.click(".branch-minimap.minimal");
 await waitFor(p1, () => document.querySelector(".branch-minimap.expanded .bm-head .icon-btn"), "minimap expanded by a click", 5000);
+// git graph: a row per kept node, the viewed thread's tip marked, a node on another thread opens that thread
+await waitFor(p1, () => {
+  const g = window.SFHApp.current.branches.graph, rows = document.querySelectorAll(".branch-minimap .bm-row[data-node]");
+  return g && rows.length === g.nodes.length && document.querySelectorAll(".branch-minimap .bm-node").length === g.nodes.length &&
+    document.querySelector(".branch-minimap .bm-row.active") && document.querySelector(".branch-minimap .bm-here");
+}, "graph rows match the server's nodes", 5000);
+if (process.env.SHOT) await p1.screenshot({ path: process.env.SHOT });
+const other = await p1.evaluate(() => {
+  const c = window.SFHApp.current, n = c.branches.graph.nodes.find((x) => x.mid != null && x.thread !== c.branchId && !c.messages.some((m) => m.id === x.mid));
+  return n && { id: n.id, thread: n.thread, mid: n.mid };
+});
+if (!other) await fail("no graph node on another thread");
+await p1.click('.branch-minimap .bm-row[data-node="' + other.id + '"]');
+await waitFor(p1, (o) => window.SFHApp.current.branchId === o.thread && !window.SFHApp.current.loading &&
+  document.querySelector('.msgs [data-mid="' + o.mid + '"].bm-flash'), "node click opens its thread at the message", 8000, other);
+const first = await p1.evaluate(() => window.SFHApp.current.branches.graph.nodes[0].id);
+await p1.click('.branch-minimap .bm-row[data-node="' + first + '"]');
+await waitFor(p1, (o, f) => window.SFHApp.current.branchId === o.thread &&
+  document.querySelector('.msgs [data-mid="' + f.slice(1) + '"].bm-flash'), "a node on the viewed thread just scrolls", 8000, other, first);
+await p1.evaluate((r) => { location.hash = "#session/" + encodeURIComponent(window.SFHApp.current.id) + "/" + encodeURIComponent(r); }, rootBid);
+await waitFor(p1, (r) => window.SFHApp.current.branchId === r && !window.SFHApp.current.loading, "back on the root thread", 8000, rootBid);
 await p1.click(".branch-minimap.expanded .bm-head .icon-btn");
 await new Promise((r) => setTimeout(r, 150));
 await waitFor(p1, () => document.querySelector(".branch-minimap.minimal") && !window.SFHApp.current.minimapExpanded, "⇥ minimizes the sidebar", 5000);
-step("minimap: click expands to the sidebar, ⇥ minimizes it back");
+step("minimap: git graph rows, node clicks switch thread or scroll, ⇥ minimizes");
 
 // 9c. peer sessions: a second session in the same directory asks this one a question (held: it is the
 // user's idle session), the peer strip + inbox show it, "Let it answer" delivers it; a shared file is flagged

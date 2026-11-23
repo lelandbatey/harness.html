@@ -1354,6 +1354,12 @@
     updateHeader();
     updateComposer();
     renderSidebar();
+    if (c.pendingScrollMid != null) {
+      // a minimap node on another thread: open that thread at the node's message
+      var pmid = c.pendingScrollMid;
+      c.pendingScrollMid = null;
+      requestAnimationFrame(function () { if (cur === c) scrollToMessage(c, pmid); });
+    }
     if (c.inner) {
       // spatial navigation: the clicked thread slides in from its side (children right, parent left)
       var dir = c.slideDir;
@@ -1378,7 +1384,7 @@
       // precomputed by the server (forks, parent link and previews relative to each thread); keep local toggles
       var v = bd.views[activeBid];
       var local = bd.localExpanded || {};
-      return Object.assign({}, v, { branches: v.branches.map(function (b) {
+      return Object.assign({}, v, { graph: bd.info.graph, branches: v.branches.map(function (b) {
         return local.hasOwnProperty(b.id) ? Object.assign({}, b, { expanded: local[b.id] }) : b;
       }) });
     }
@@ -1661,94 +1667,109 @@
     });
   }
 
-  // Build SVG markup for the thread graph (shared by both minimal translucent mode and expanded sidebar)
-  function buildGraphSvg(ordered, kids, colorMap, opts) {
-    var ROW_H = opts.rowH, PAD_X = opts.padX, LANE_W = opts.laneW, mini = !!opts.mini;
-    var rowOf = new Map(), laneOf = new Map(), maxLane = 0;
-    ordered.forEach(function (item, idx) {
-      rowOf.set(item.b.id, idx);
-      var lane = Math.min(4, item.depth);
-      laneOf.set(item.b.id, lane);
-      if (lane > maxLane) maxLane = lane;
-    });
-    var graphW = PAD_X * 2 + maxLane * LANE_W;
-    var barArea = mini ? 34 : 0;
-    var svgW = graphW + barArea;
-    var svgH = ordered.length * ROW_H;
-    var svgParts = [];
+  // ---- git-graph minimap (v19) -------------------------------------------------------------------
+  // The server computes the graph (branches._graph): kept commits as rows in time order, each with a lane, its
+  // parent node, its owning thread and how many straight-line commits were folded into the edge above it.
+  var GRAPH_MAX_LANES = 8;
 
-    // Vertical trunks for parent threads down to their last direct child
-    ordered.forEach(function (item, idx) {
-      var b = item.b, ch = kids.get(b.id) || [];
-      if (!ch.length) return;
-      var lastIdx = idx;
-      ch.forEach(function (k) { if (rowOf.has(k.id) && rowOf.get(k.id) > lastIdx) lastIdx = rowOf.get(k.id); });
-      if (lastIdx > idx) {
-        var px = PAD_X + laneOf.get(b.id) * LANE_W;
-        var y0 = idx * ROW_H + ROW_H / 2;
-        var y1 = lastIdx * ROW_H + ROW_H / 2 - (mini ? 6 : 14);
-        var pcol = laneColor(colorMap.get(b.id) || 0);
-        if (y1 > y0) {
-          svgParts.push('<line x1="' + px + '" y1="' + y0 + '" x2="' + px + '" y2="' + y1 +
-            '" stroke="' + pcol + '" stroke-width="' + (mini ? 1.5 : (b.is_active ? 2.4 : 1.7)) + '" stroke-opacity="0.45" stroke-linecap="round"/>');
-        }
-      }
-    });
+  function graphActivePath(g, activeBid) {
+    var byId = new Map(), onPath = new Set(), tipId = null;
+    g.nodes.forEach(function (n) { byId.set(n.id, n); if (n.tips.indexOf(activeBid) >= 0) tipId = n.id; });
+    for (var k = tipId; k && byId.has(k) && !onPath.has(k); k = byId.get(k).parent) onPath.add(k);
+    return { byId: byId, onPath: onPath, tipId: tipId };
+  }
 
-    // Curved parent -> child connectors (solid = forked context, dashed = fresh context!)
-    ordered.forEach(function (item, idx) {
-      var b = item.b;
-      var x = PAD_X + laneOf.get(b.id) * LANE_W;
-      var y = idx * ROW_H + ROW_H / 2;
-      var col = laneColor(colorMap.get(b.id) || 0);
-      var isFresh = b.context_mode === "fresh";
-      var dash = isFresh ? (mini ? ' stroke-dasharray="2 2"' : ' stroke-dasharray="3.5 2.5"') : "";
-      var pId = b.parent_branch_id;
-      if (pId && rowOf.has(pId)) {
-        var px = PAD_X + laneOf.get(pId) * LANE_W;
-        var py = Math.max(rowOf.get(pId) * ROW_H + ROW_H / 2, y - ROW_H * 0.72);
-        var midY = (py + y) / 2;
-        svgParts.push('<path d="M' + px + ',' + py + ' C' + px + ',' + midY + ' ' + x + ',' + midY + ' ' + x + ',' + y +
-          '" fill="none" stroke="' + col + '" stroke-width="' + (mini ? (b.is_active ? 2 : 1.3) : (b.is_active ? 2.4 : 1.7)) +
-          '" stroke-opacity="' + (b.is_active ? "1" : "0.78") + '"' + dash + ' stroke-linecap="round"/>');
-      } else if (idx > 0) {
-        var rx = PAD_X, ry = ROW_H / 2;
-        svgParts.push('<path d="M' + rx + ',' + ry + ' C' + rx + ',' + (ry + 8) + ' ' + x + ',' + (y - 8) + ' ' + x + ',' + y +
-          '" fill="none" stroke="' + col + '" stroke-width="1.4" stroke-dasharray="2.5 2" stroke-opacity="0.6"/>');
-      }
-    });
+  function graphNodeTitle(n, b) {
+    var who = n.role === "assistant" ? "Agent" : n.role === "user" ? "User" : "";
+    var t = (b ? b.name : n.thread) + (n.tips.length && !n.mid ? " (no messages yet)" : "");
+    if (n.preview) t += "\n" + (n.edit ? "↺ " : "") + who + ": " + n.preview;
+    if (n.hidden) t += "\n· " + n.hidden + " earlier message" + (n.hidden === 1 ? "" : "s") + " folded above";
+    return t;
+  }
 
-    // Nodes + (in minimal mode) Sublime Text-style miniature proportional bars
-    var maxMsgs = Math.max(1, ordered.reduce(function (m, it) { return Math.max(m, it.b.own_messages || 1); }, 1));
-    ordered.forEach(function (item, idx) {
-      var b = item.b;
-      var x = PAD_X + laneOf.get(b.id) * LANE_W;
-      var y = idx * ROW_H + ROW_H / 2;
-      var col = laneColor(colorMap.get(b.id) || 0);
-      var isFresh = b.context_mode === "fresh";
-      var rActive = mini ? 3.2 : 4.2, rNorm = mini ? 2.4 : 3.4;
-      if (b.is_active) {
-        svgParts.push('<circle cx="' + x + '" cy="' + y + '" r="' + (mini ? 5.6 : 7.2) + '" fill="' + col + '" fill-opacity="0.24"/>');
-        svgParts.push('<circle cx="' + x + '" cy="' + y + '" r="' + rActive + '" fill="' + (isFresh ? "var(--panel)" : col) +
-          '" stroke="' + (isFresh ? col : "var(--panel)") + '" stroke-width="' + (isFresh ? 2 : 1.4) + '"/>');
-      } else {
-        svgParts.push('<circle cx="' + x + '" cy="' + y + '" r="' + rNorm + '" fill="var(--panel)" stroke="' + col +
-          '" stroke-width="' + (mini ? 1.6 : 2) + '"' + (isFresh ? ' stroke-dasharray="1.8 1.2"' : "") + '/>');
+  // Layout shared by the minimal strip (uniform rows, no labels) and the expanded sidebar (titled rows taller)
+  function graphLayout(g, opts) {
+    var ys = [], y = 0;
+    g.nodes.forEach(function (n) {
+      var h = opts.mini ? opts.rowH : (n.start ? opts.rowH : opts.rowHSmall);
+      ys.push(y + h / 2);
+      n._h = h;
+      y += h;
+    });
+    var lanes = Math.min(GRAPH_MAX_LANES, g.lanes || 1);
+    return { ys: ys, height: y, width: opts.padX * 2 + (lanes - 1) * opts.laneW,
+      x: function (lane) { return opts.padX + Math.min(lane || 0, GRAPH_MAX_LANES - 1) * opts.laneW; } };
+  }
+
+  function buildGraphSvg(g, threads, colorMap, ap, opts) {
+    var mini = !!opts.mini, L = graphLayout(g, opts), parts = [];
+    var rowOf = new Map();
+    g.nodes.forEach(function (n, i) { rowOf.set(n.id, i); });
+    var col = function (bid) { return laneColor(colorMap.get(bid) || 0); };
+    // edges: leave the parent, bend into the child's lane right away, then run straight down (git log --graph)
+    g.nodes.forEach(function (n, i) {
+      if (!n.parent || !rowOf.has(n.parent)) return;
+      var pi = rowOf.get(n.parent), px = L.x(g.nodes[pi].lane), py = L.ys[pi], x = L.x(n.lane), y = L.ys[i];
+      var on = ap.onPath.has(n.id), c = col(n.thread);
+      var w = mini ? (on ? 1.9 : 1.2) : (on ? 2.4 : 1.6);
+      var dash = n.fresh ? (mini ? ' stroke-dasharray="2 2"' : ' stroke-dasharray="3.5 2.5"') : "";
+      var d;
+      if (px === x) d = "M" + px + "," + py + " L" + x + "," + y;
+      else {
+        var bend = Math.min(y - py, mini ? 8 : 16);
+        d = "M" + px + "," + py + " C" + px + "," + (py + bend * 0.6) + " " + x + "," + (py + bend * 0.4) + " " + x + "," + (py + bend) +
+          " L" + x + "," + y;
       }
-      if (b.is_main) {
-        svgParts.push('<text x="' + (x + (mini ? 4 : 6)) + '" y="' + (y - (mini ? 3 : 5)) + '" font-size="' + (mini ? 7 : 9) +
-          '" fill="#d4a017" class="bm-main-star">★</text>');
-      }
-      if (mini) {
-        var bw = Math.max(6, Math.round(28 * Math.sqrt((b.own_messages || 1) / maxMsgs)));
-        var bx = graphW;
-        svgParts.push('<rect x="' + bx + '" y="' + (y - 2) + '" width="' + bw + '" height="4" rx="2" fill="' + col +
-          '" fill-opacity="' + (b.is_active ? "0.9" : "0.35") + '"><title>' + MD.escape(b.name + " (" + b.kind + ", " + b.own_messages + "m)") + '</title></rect>');
+      parts.push('<path d="' + d + '" fill="none" stroke="' + c + '" stroke-width="' + w + '" stroke-opacity="' + (on ? 1 : 0.6) +
+        '"' + dash + ' stroke-linecap="round">' + (n.hidden ? "<title>" + MD.escape(n.hidden + " folded message" + (n.hidden === 1 ? "" : "s")) + "</title>" : "") + "</path>");
+      if (n.hidden && !mini) {
+        // folded straight-line commits: a count shown only while hovering the graph
+        parts.push('<text class="bm-gap" x="' + (x + 4) + '" y="' + ((Math.max(py + 16, y - 14) + y) / 2) + '" font-size="9">·' + n.hidden + "</text>");
       }
     });
+    g.nodes.forEach(function (n, i) {
+      var x = L.x(n.lane), y = L.ys[i], c = col(n.thread), b = threads.get(n.thread);
+      var isTip = n.id === ap.tipId;
+      var r = n.start ? (mini ? 2.8 : 4.2) : (mini ? 2 : 3);
+      var s = "";
+      if (isTip) s += '<circle cx="' + x + '" cy="' + y + '" r="' + (r + (mini ? 3 : 4)) + '" fill="' + c + '" fill-opacity="0.28" class="bm-here"/>';
+      if (n.start || isTip) s += '<circle cx="' + x + '" cy="' + y + '" r="' + r + '" fill="' + (n.fresh ? "var(--panel)" : c) + '" stroke="' + (n.fresh ? c : "var(--panel)") +
+        '" stroke-width="' + (n.fresh ? 1.8 : 1.2) + '"' + (n.fresh ? ' stroke-dasharray="1.8 1.2"' : "") + "/>";
+      else s += '<circle cx="' + x + '" cy="' + y + '" r="' + r + '" fill="var(--panel)" stroke="' + c + '" stroke-width="' + (mini ? 1.4 : 1.8) + '"/>';
+      var isMainTip = n.tips.indexOf(g.main_branch_id) >= 0, isMainStart = n.start && n.thread === g.main_branch_id;
+      if (isMainTip || isMainStart) {
+        s += '<text x="' + (x + (mini ? 3 : 6)) + '" y="' + (y - (mini ? 2 : 4)) + '" font-size="' + (mini ? 7 : 9) + '" fill="#d4a017" class="bm-main-star">★</text>';
+      }
+      if (n.edit && !mini) s += '<text x="' + (x + 5) + '" y="' + (y + 9) + '" font-size="9" fill="' + c + '">↺</text>';
+      parts.push('<g class="bm-node" data-node="' + MD.escape(n.id) + '" data-thread="' + MD.escape(n.thread) + '"><title>' +
+        MD.escape(graphNodeTitle(n, b)) + "</title>" + s + "</g>");
+    });
+    return '<svg xmlns="http://www.w3.org/2000/svg" width="' + L.width + '" height="' + L.height +
+      '" viewBox="0 0 ' + L.width + " " + L.height + '">' + parts.join("") + "</svg>";
+  }
 
-    return '<svg xmlns="http://www.w3.org/2000/svg" width="' + svgW + '" height="' + svgH +
-      '" viewBox="0 0 ' + svgW + ' ' + svgH + '">' + svgParts.join("") + "</svg>";
+  // Scrolls the conversation to a message (opening the collapsed inherited history if it sits there)
+  function scrollToMessage(c, mid) {
+    if (!c || !c.msgsEl || mid == null) return false;
+    var m = c.msgsEl.querySelector('[data-mid="' + mid + '"]');
+    if (!m) return false;
+    if (c.inheritWrap && c.inheritWrap.hidden && c.inheritWrap.contains(m)) toggleInherited();
+    c.stick = false;
+    m.scrollIntoView({ block: "center" });
+    m.classList.remove("bm-flash");
+    void m.offsetWidth;
+    m.classList.add("bm-flash");
+    return true;
+  }
+
+  // Clicking a node: a message on the viewed thread just scrolls there; otherwise open the node's thread at it
+  function gotoGraphNode(n) {
+    var c = cur;
+    if (!c) return;
+    var here = n.mid != null && c.messages.some(function (m) { return m.id === n.mid; });
+    if (here) { scrollToMessage(c, n.mid); return; }
+    c.pendingScrollMid = n.mid;
+    switchBranch(n.thread);
   }
 
   function renderMinimap() {
@@ -1756,7 +1777,8 @@
     if (!c || !c.minimapEl) return;
     var info = c.branches;
     var list = info && info.branches ? info.branches : [];
-    if (list.length <= 1) {
+    var g = info && info.graph;
+    if (list.length <= 1 || !g || !g.nodes || !g.nodes.length) {
       c.minimapEl.hidden = true;
       c.minimapEl.textContent = "";
       c.minimapEl.className = "branch-minimap";
@@ -1764,26 +1786,26 @@
     }
     c.minimapEl.hidden = false;
     c.minimapEl.textContent = "";
-    var tree = orderThreadsTree(list);
-    var ordered = tree.ordered, kids = tree.kids;
+    g.main_branch_id = info.main_branch_id;
     var colorMap = branchLaneMap(list);
+    var threads = new Map(list.map(function (b) { return [b.id, b]; }));
+    var ap = graphActivePath(g, c.branchId);
 
-    // Mode A (default): Sublime Text-like translucent minimal strip; clicking opens the full graph sidebar
+    // Mode A (default): Sublime Text-like translucent strip with the same graph minus labels; a click expands it
     if (!c.minimapExpanded) {
       c.minimapEl.className = "branch-minimap minimal";
       c.minimapEl.tabIndex = 0;
       c.minimapEl.setAttribute("role", "button");
-      c.minimapEl.title = "Thread minimap (" + list.length + " threads) — click to open the full graph sidebar";
+      c.minimapEl.title = "Thread graph (" + list.length + " threads) — click to open the sidebar";
       c.minimapEl.onclick = function () { setMinimapExpanded(true); };
       c.minimapEl.onkeydown = function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setMinimapExpanded(true); } };
-      var miniSvg = el("div", { class: "bm-svg", html: buildGraphSvg(ordered, kids, colorMap, { rowH: 18, padX: 8, laneW: 10, mini: true }) });
       c.minimapEl.append(
         el("div", { class: "bm-mini-head" }, el("span", { text: "⑂ " + list.length }), el("span", { text: "◂" })),
-        miniSvg);
+        el("div", { class: "bm-svg", html: buildGraphSvg(g, threads, colorMap, ap, { rowH: 10, padX: 6, laneW: 8, mini: true }) }));
       return;
     }
 
-    // Mode B (expanded): full right-hand graph sidebar
+    // Mode B (expanded): the graph with a row per node; thread starts carry the title, other nodes are small
     c.minimapEl.className = "branch-minimap expanded";
     c.minimapEl.removeAttribute("tabindex");
     c.minimapEl.removeAttribute("role");
@@ -1791,12 +1813,12 @@
     c.minimapEl.onclick = null;
     c.minimapEl.onkeydown = null;
 
-    var svg = el("div", { class: "bm-svg", html: buildGraphSvg(ordered, kids, colorMap, { rowH: 40, padX: 12, laneW: 14, mini: false }) });
+    var opts = { rowH: 36, rowHSmall: 20, padX: 10, laneW: 14, mini: false };
+    var svg = el("div", { class: "bm-svg", html: buildGraphSvg(g, threads, colorMap, ap, opts) });
     var rows = el("div", { class: "bm-rows" });
-    ordered.forEach(function (item) {
-      var b = item.b;
+    function threadActs(b) {
       var href = threadHref(c.id, b.id);
-      var acts = el("div", { class: "bm-row-acts" },
+      return el("div", { class: "bm-row-acts" },
         el("a", { class: "bm-act", href: href, target: "_blank", rel: "noopener", title: "Open in a new tab", text: "↗",
           onclick: function (e) { e.stopPropagation(); } }),
         S.offline || b.is_main ? null : el("button", { class: "bm-act", type: "button", title: "Set as main thread", text: "★",
@@ -1805,20 +1827,37 @@
           onclick: function (e) { e.preventDefault(); e.stopPropagation(); renameBranch(b.id, b.name); } }),
         S.offline ? null : el("button", { class: "bm-act del", type: "button", title: "Delete thread", text: "✕",
           onclick: function (e) { e.preventDefault(); e.stopPropagation(); deleteBranch(b.id, b.name); } }));
-      var kindTag = b.kind === "subagent" ? ("sub·" + (b.context_mode || "fresh")) : b.kind;
-      var row = el("a", { class: "bm-row" + (b.is_active ? " active" : "") + (b.is_main ? " is-main" : "") +
-          (b.kind === "subagent" ? " is-subagent" : ""),
-        href: href, "data-branch-id": b.id,
-        title: b.name + " (" + b.id + ", " + b.kind + ", " + (b.context_mode || "fork") + " context)\n" +
-          b.own_messages + " message" + (b.own_messages === 1 ? "" : "s") +
-          (b.fork_preview ? "\nAt: " + b.fork_preview : "") },
-        el("div", { class: "bm-row-info" },
-          el("span", { class: "bm-row-title" }, b.is_main ? el("span", { class: "bm-star", title: "main thread", text: "★ " }) : null, b.name),
+    }
+    g.nodes.forEach(function (n) {
+      var b = threads.get(n.thread);
+      if (!b) return;
+      var label;
+      if (n.start) {
+        var kindTag = b.kind === "subagent" ? ("sub·" + (b.context_mode || "fresh")) : b.kind;
+        label = el("div", { class: "bm-row-info" },
+          el("span", { class: "bm-row-title" }, b.is_main ? el("span", { class: "bm-star", title: "main thread", text: "★ " }) : null,
+            b.kind === "root" || b.kind === "edit" ? null : el("span", { class: "bm-glyph", text: threadGlyph(b) + " " }), b.name),
           el("span", { class: "bm-row-sub" },
             el("span", { class: "btag", text: kindTag }),
             el("span", { text: b.own_messages + "m" }),
-            b.status === "running" ? el("span", { class: "status-dot", title: "running" }) : null)),
-        acts);
+            b.status === "running" ? el("span", { class: "status-dot", title: "running" }) : null));
+      } else {
+        label = el("div", { class: "bm-row-info small" },
+          n.tips.indexOf(info.main_branch_id) >= 0 ? el("span", { class: "bm-star", title: "main thread tip", text: "★" }) : null,
+          n.edit ? el("span", { class: "bm-glyph", title: "edited message", text: "↺" }) : null);
+      }
+      var row = el("a", { class: "bm-row" + (n.start ? "" : " small") + (n.id === ap.tipId ? " active" : "") +
+          (ap.onPath.has(n.id) ? " on-path" : "") + (b.is_main ? " is-main" : "") + (b.kind === "subagent" ? " is-subagent" : ""),
+        href: threadHref(c.id, n.thread), "data-branch-id": n.thread, "data-node": n.id,
+        style: "height:" + n._h + "px", title: graphNodeTitle(n, b),
+        onclick: function (e) {
+          if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey) return;
+          e.preventDefault();
+          gotoGraphNode(n);
+        },
+        onmouseenter: function () { markThreadHover(rows, n.thread, true); },
+        onmouseleave: function () { markThreadHover(rows, n.thread, false); } },
+        label, threadActs(b));
       rows.append(row);
     });
 
@@ -1833,6 +1872,11 @@
           // aside this click is still bubbling to, which would immediately re-expand it
           onclick: function (e) { e.stopPropagation(); setMinimapExpanded(false); } })),
       el("div", { class: "bm-body" }, el("div", { class: "bm-graph-wrap" }, svg, rows)));
+  }
+
+  // hovering any node of a thread shows that thread's controls on all of its rows
+  function markThreadHover(rows, bid, on) {
+    rows.querySelectorAll('.bm-row[data-branch-id="' + bid + '"]').forEach(function (r) { r.classList.toggle("thread-hover", on); });
   }
 
   function decorateBranchCard(card, b) {

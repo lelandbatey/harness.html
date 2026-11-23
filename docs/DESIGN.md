@@ -1177,3 +1177,43 @@ thread for new subscribers is main), deleting main moves the tag to the parent, 
 broadcast to other tabs, `parent_link`/`preview`/ordering in `tree_info`. `test/browser.mjs`: the v17 subagent step
 updated to threads (spawn card → thread link, `<thread-message>` card, sidebar thread tree), plus collapsed
 inherited history, spatial previews (modes by width), `+N`, and the pinned `★` main entry.
+
+## v19: the minimap as a git graph (questions/036)
+
+README: the minimap shows the session like `git log --graph`: every user prompt and every turn's final agent message
+is a commit, straight-line commits are folded away, branch starts carry the thread title.
+
+### Graph (`branches._graph`, part of `tree_info` as `graph`)
+- Commits: user prompts (`_is_user_prompt`) and assistant messages without tool calls (`_is_turn_final`). A commit's
+  parent is the previous commit on any path through it (the message tree makes this a tree).
+- Kept nodes: the first commit; fork points (≥ 2 child commits); each thread's first own commit (`start`, labelled
+  with the thread's title); each thread's tip (`tips: [thread ids]`); later versions of an edited prompt (`edit`,
+  ↺; the oldest version under a parent is the original). A thread with no commits of its own yet gets a placeholder
+  node `t:<thread id>`. Every other commit is folded into the edge above the next kept node (`hidden` = count).
+- Subagents attach to the final message of the parent turn that spawned them, or to that turn's prompt while the
+  turn is still running; fresh ones are `fresh` (dashed).
+- Ownership (`thread`): the first thread (creation order) holding the commit after its fork point; for starts and
+  placeholders, the thread itself.
+- Rows: time order (message `created_at`), never above a parent (heap-ordered topological sort).
+- Lanes: chains of nodes. Main's line (root to main's tip) is lane 0 and only continues with main's own commits;
+  other chains continue with the same thread's next node, else the oldest child, and every other child starts a new
+  chain. Chains get the lowest lane free since their fork row, so ended lines are reused (like `git log --graph`).
+  Colours stay tied to threads (creation order).
+- Offline snapshots carry the graph once (`info.graph`); the per-thread `views` drop it.
+
+### Web (`buildGraphSvg`, `renderMinimap`)
+- Both displays draw the same graph. Minimal: uniform 10px rows, no labels, click expands. Expanded: a row per node,
+  36px titled rows for thread starts (★ for main, kind glyph, kind tag, message count, running dot) and 20px untitled
+  rows for other nodes (★ on main's tip, ↺ on edits).
+- The viewed thread's tip gets the glow ring; its path from the first commit is drawn thicker and its rows tinted.
+- Edges leave the parent, bend into the child's lane, and run straight down. Folded counts (`·N`) appear only while
+  hovering the graph; every node has a tooltip with the thread, the message preview and the folded count.
+- Clicking a node scrolls to its message when it is on the viewed thread (opening collapsed inherited history if
+  needed); otherwise it opens the node's thread and scrolls there (`pendingScrollMid`). Hovering any node of a thread
+  shows that thread's controls (↗ ★ ✎ ✕) on all of its rows.
+- The `⇥` button stops its click from bubbling into the re-rendered minimal strip (which re-expanded the sidebar).
+
+### Tests
+`test/test_graph.py` (the README example: kept nodes, folding, ↺, lane reuse, main on lane 0 after promotion,
+subagent anchors while running and after, placeholder tips, multiple edits, asides from main's tip).
+`test/browser.mjs`: rows match the server's nodes, node clicks switch thread or scroll, `⇥` minimizes.

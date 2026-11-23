@@ -532,6 +532,238 @@ def _preview(path_ids_, msg_meta, start=0):
     return {"prompt": prompt, "reply": reply}
 
 
+def _is_turn_final(role, content):
+    """An assistant message that ends its turn (no tool calls left to run)."""
+    return role == "assistant" and bool(content) and not any(b.get("type") == "tool_use" for b in content) \
+        and not any(b.get("compaction") for b in content)
+
+
+def _graph(brows, paths, own_sets, parent_branch, summaries, msg_meta, main_bid):
+    """The minimap's git graph (independent of the viewed thread).
+    Commits are user prompts and the final assistant message of each turn. Only these are kept: the first commit,
+    fork points, each thread's first commit (labelled with its title) and tip, and the prompt that replaced an
+    edited one (↺). Every other commit is folded into the edge below it (`hidden`). Subagents attach at their
+    parent turn's final message (its prompt while that turn still runs). Rows are in time order (parents first);
+    main's line is lane 0 and the other lines reuse lanes once they end (like `git log --graph`)."""
+    sums = {s["id"]: s for s in summaries}
+    order = [r[0] for r in brows]
+
+    def is_commit(mid):
+        m = msg_meta.get(mid)
+        return bool(m) and (_is_user_prompt(m[0], m[2]) or _is_turn_final(m[0], m[2]))
+
+    cparent, tip, start = {}, {}, {}
+    for bid in order:
+        prev = None
+        for mid in paths[bid]:
+            if is_commit(mid):
+                cparent.setdefault(mid, prev)
+                prev = mid
+        tip[bid] = prev
+        start[bid] = next((mid for mid in paths[bid] if mid in own_sets[bid] and is_commit(mid)), None)
+    owner = {}
+    for bid in order:
+        for mid in paths[bid]:
+            if mid in own_sets[bid] and mid in cparent:
+                owner.setdefault(mid, bid)
+    for bid in order:  # commits only reachable through an inherited prefix (should not happen) still get one
+        for mid in paths[bid]:
+            if mid in cparent:
+                owner.setdefault(mid, bid)
+
+    def anchor(bid):
+        """Subagents: the final message of the parent turn that spawned them (its prompt until it arrives)."""
+        s = sums[bid]
+        pb = parent_branch.get(bid)
+        pp = paths.get(pb) or []
+        at = s["spawned_at_id"]
+        if at is None or at not in pp:
+            return tip.get(pb) if s["context_mode"] == "fresh" and pb else None
+        i = pp.index(at)
+        for mid in pp[i:]:
+            if mid in cparent:
+                m = msg_meta[mid]
+                if _is_turn_final(m[0], m[2]):
+                    return mid
+                break
+        return next((mid for mid in reversed(pp[:i + 1]) if mid in cparent and
+                     _is_user_prompt(msg_meta[mid][0], msg_meta[mid][2])), None)
+
+    nid = lambda mid: "m%d" % mid
+    nodes = {}
+
+    def node(key, thread, mid=None, t=0):
+        if key not in nodes:
+            nodes[key] = {"id": key, "mid": mid, "thread": thread, "parent": None, "hidden": 0, "fresh": False,
+                          "start": False, "tips": [], "edit": False, "role": "", "preview": "", "t": t or 0}
+        return nodes[key]
+
+    kparent_override = {}
+    fresh_keys = set()
+    for bid in order:
+        s = sums[bid]
+        if s["kind"] == "subagent":
+            a = anchor(bid)
+            first = start[bid]
+            if first is not None:
+                kparent_override[first] = a
+                if s["context_mode"] == "fresh":
+                    fresh_keys.add(nid(first))
+    # every thread has a tip node: its last commit, or (no commits of its own yet) a placeholder
+    virtual = {}
+    for bid in order:
+        if start[bid] is None and bid != order[0]:
+            s = sums[bid]
+            base = anchor(bid) if s["kind"] == "subagent" else tip[bid]
+            key = "t:" + bid
+            n = node(key, bid, None, s["created_at"])
+            n["start"] = True
+            n["tips"].append(bid)
+            n["fresh"] = s["context_mode"] == "fresh"
+            virtual[key] = base
+
+    def cpar(mid):
+        return kparent_override[mid] if mid in kparent_override else cparent.get(mid)
+
+    children = {}
+    for mid in cparent:
+        p = cpar(mid)
+        if p is not None:
+            children.setdefault(p, []).append(mid)
+    for key, base in virtual.items():
+        if base is not None:
+            children.setdefault(base, []).append(key)
+
+    keep = set()
+    for mid in cparent:
+        if cpar(mid) is None or len(children.get(mid, [])) >= 2:
+            keep.add(mid)
+    for bid in order:
+        if start[bid] is not None:
+            keep.add(start[bid])
+        if start[bid] is not None or bid == order[0]:
+            if tip[bid] is not None:
+                keep.add(tip[bid])
+    # ↺: every later version of an edited prompt (the versions share a parent; the oldest is the original)
+    edit_new = set()
+    for o in {sums[b]["origin_id"] for b in order if sums[b]["kind"] == "edit" and sums[b]["origin_id"] is not None}:
+        versions = sorted((mid for mid in children.get(o, []) if isinstance(mid, int) and
+                           _is_user_prompt(msg_meta[mid][0], msg_meta[mid][2])), key=lambda m: (msg_meta[m][3], m))
+        edit_new.update(versions[1:])
+    keep |= edit_new
+
+    starts = {start[b]: b for b in order if start[b] is not None}
+    for mid in keep:
+        m = msg_meta[mid]
+        n = node(nid(mid), owner.get(mid, order[0]), mid, m[3])
+        n["role"] = m[0]
+        text = _prompt_text(m[2]) if m[0] == "user" else \
+            " ".join(b.get("text", "") for b in m[2] if b.get("type") == "text")
+        n["preview"] = _clip(text, 200)
+        n["edit"] = mid in edit_new
+        if mid in starts:
+            n["start"] = True
+            n["thread"] = starts[mid]
+        n["fresh"] = nid(mid) in fresh_keys
+        # walk up to the nearest kept commit, counting the folded ones
+        p, hidden = cpar(mid), 0
+        while p is not None and p not in keep:
+            hidden += 1
+            p = cpar(p)
+        n["parent"] = nid(p) if p is not None else None
+        n["hidden"] = hidden
+    for key, base in virtual.items():
+        p, hidden = base, 0
+        while p is not None and p not in keep:
+            hidden += 1
+            p = cpar(p)
+        nodes[key]["parent"] = nid(p) if p is not None else None
+        nodes[key]["hidden"] = hidden
+    for bid in order:
+        if start[bid] is not None or bid == order[0]:
+            if tip[bid] is not None and nid(tip[bid]) in nodes:
+                nodes[nid(tip[bid])]["tips"].append(bid)
+
+    # rows: time order, but never above a parent
+    kids = {}
+    for n in nodes.values():
+        if n["parent"] in nodes:
+            kids.setdefault(n["parent"], []).append(n["id"])
+        else:
+            n["parent"] = None
+    import heapq
+    heap = [(n["t"], n["id"]) for n in nodes.values() if n["parent"] is None]
+    heapq.heapify(heap)
+    rows = []
+    while heap:
+        _, k = heapq.heappop(heap)
+        nodes[k]["row"] = len(rows)
+        rows.append(k)
+        for c in kids.get(k, []):
+            heapq.heappush(heap, (nodes[c]["t"], c))
+
+    # lanes: chains follow main's line, else the same thread, else the oldest child
+    main_tip = next((n["id"] for n in nodes.values() if main_bid in n["tips"]), None)
+    on_main = set()
+    k = main_tip
+    while k is not None:
+        on_main.add(k)
+        k = nodes[k]["parent"]
+    chains = []
+    chain_of = {}
+
+    def build(first):
+        chain = []
+        k = first
+        while k is not None:
+            chain.append(k)
+            chain_of[k] = len(chains)
+            ks = sorted(kids.get(k, []), key=lambda c: nodes[c]["row"])
+            if not ks:
+                break
+            if k in on_main:  # main's line stays main's: everything else branches off it
+                k = next((c for c in ks if c in on_main), None)
+                continue
+            k = next((c for c in ks if nodes[c]["thread"] == nodes[k]["thread"] and not nodes[c]["start"]), None) or \
+                next((c for c in ks if nodes[c]["thread"] == nodes[k]["thread"]), None) or ks[0]
+        chains.append(chain)
+        for c in chain:
+            for o in sorted(kids.get(c, []), key=lambda x: nodes[x]["row"]):
+                if o not in chain_of:
+                    build(o)
+    roots = [k for k in rows if nodes[k]["parent"] is None]
+    roots.sort(key=lambda k: (0 if k in on_main else 1, nodes[k]["row"]))
+    for r in roots:
+        build(r)
+    lane_end = []  # last row used by each lane
+    span = []
+    for ch in chains:
+        first = nodes[ch[0]]
+        s = nodes[first["parent"]]["row"] if first["parent"] else first["row"]
+        span.append((s, nodes[ch[-1]]["row"]))
+    main_chain = chain_of.get(main_tip) if main_tip else (chain_of.get(roots[0]) if roots else None)
+    lane_of = {}
+    if main_chain is not None:
+        lane_of[main_chain] = 0
+        lane_end.append(10 ** 9)  # main's lane is never reused
+    for ci in sorted(range(len(chains)), key=lambda i: span[i]):
+        if ci in lane_of:
+            continue
+        s, e = span[ci]
+        lane = next((i for i in range(len(lane_end)) if lane_end[i] < s), None)
+        if lane is None:
+            lane = len(lane_end)
+            lane_end.append(e)
+        lane_end[lane] = e
+        lane_of[ci] = lane
+    for k, ci in chain_of.items():
+        nodes[k]["lane"] = lane_of[ci]
+    out = [nodes[k] for k in rows]
+    for n in out:
+        n.pop("t", None)
+    return {"nodes": out, "lanes": max([n["lane"] for n in out] + [0]) + 1, "main_tip": main_tip}
+
+
 def tree_info(agent, sid, active_bid=None):
     """Full thread tree & fork/spawn points relative to `active_bid` (the thread a tab views).
     - branches: every thread (creation order, root first); `is_main` marks the main tag
@@ -544,7 +776,8 @@ def tree_info(agent, sid, active_bid=None):
     with store.lock:
         brows = store.query("SELECT %s FROM branches WHERE session_id=? ORDER BY created_at, id" % BRANCH_COLS,
                             (sid,))
-        mrows = store.query("SELECT id, parent_id, role, content FROM messages WHERE session_id=?", (sid,))
+        mrows = store.query("SELECT id, parent_id, role, content, created_at FROM messages WHERE session_id=?",
+                            (sid,))
     by_id = {r[0]: r for r in brows}
     if not active_bid or active_bid not in by_id:
         active_bid = main_bid
@@ -556,7 +789,7 @@ def tree_info(agent, sid, active_bid=None):
             content = json.loads(r[3])
         except ValueError:
             content = []
-        msg_meta[r[0]] = (r[2], r[3], content)
+        msg_meta[r[0]] = (r[2], r[3], content, r[4] or 0)
 
     paths = {}
     own_sets = {}
@@ -739,6 +972,7 @@ def tree_info(agent, sid, active_bid=None):
         "branches": summaries,
         "forks": forks,
         "parent_link": parent_link,
+        "graph": _graph(brows, paths, own_sets, parent_branch, summaries, msg_meta, main_bid),
     }
 
 
@@ -779,7 +1013,9 @@ def all_branch_data(agent, sid):
                     forks={k: [dict(c, status="idle") for c in v] for k, v in i["forks"].items()},
                     parent_link=dict(pl, status="idle") if pl else None)
     # one precomputed view per thread (forks, parent link, previews relative to that thread)
-    views = {b["id"]: idle(tree_info(agent, sid, active_bid=b["id"])) for b in info["branches"]}
+    # (the git graph doesn't depend on the viewed thread: only `info` carries it)
+    views = {b["id"]: {k: v for k, v in idle(tree_info(agent, sid, active_bid=b["id"])).items() if k != "graph"}
+             for b in info["branches"]}
     return {"info": idle(info), "views": views, "threads": threads, "messages": msgs}
 
 

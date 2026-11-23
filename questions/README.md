@@ -47,3 +47,4 @@ and add a row below.
 | [033](033-peer-sessions.md) | Peer sessions: scope, waking, storage, refusals, @ mentions | open |
 | [034](034-self-explaining-onboarding.md) | Self-explaining startup / onboarding states | done |
 | [035](035-branching-aside.md) | Lightweight conversation branching (`/aside`): main as a tag, spatial view, collapsed history | done |
+| [036](036-minimap-git-graph.md) | Minimap as a git graph: kept nodes, lanes, clicks, hover | done |
