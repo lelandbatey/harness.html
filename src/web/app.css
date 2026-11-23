@@ -698,12 +698,20 @@ a.local-missing { color: inherit; text-decoration: line-through dotted; text-dec
 .bm-row.is-main .bm-row-sub .btag { background: var(--accent-soft); color: var(--accent); }
 .bm-row.is-subagent .bm-row-sub .btag { background: var(--warn-soft); color: var(--fg-soft); }
 .bm-row-acts { display: flex; gap: 1px; opacity: 0; flex: none; }
-.bm-row:hover .bm-row-acts, .bm-row:focus-within .bm-row-acts, .bm-row.thread-hover .bm-row-acts { opacity: 1; }
+.bm-row:hover .bm-row-acts, .bm-row:focus-within .bm-row-acts, .bm-row.hover .bm-row-acts { opacity: 1; }
 /* v19 git graph: untitled nodes get short rows; the viewed thread's path is tinted; folded counts on hover */
 .bm-row.small { padding-top: 0; padding-bottom: 0; }
 .bm-row.small .bm-row-acts .bm-act { padding: 0 4px; font-size: 11px; }
 .bm-row-info.small { flex-direction: row; align-items: center; gap: 4px; font-size: 10.5px; color: var(--muted); }
-.bm-row.thread-hover { background: var(--bg-sunk); }
+/* hover: the row's band runs from the node (svg rect) into its label; the thread's nodes + edges glow */
+.bm-row.hover { background: var(--bg-sunk); border-top-left-radius: 0; border-bottom-left-radius: 0; }
+.bm-svg .bm-band { fill: transparent; }
+.bm-svg .bm-band.on { fill: var(--bg-sunk); }
+.bm-svg .bm-node { cursor: pointer; }
+.bm-svg .bm-hl { opacity: 0; }
+.bm-svg .bm-node.hl .bm-hl { opacity: 1; }
+.bm-svg .glow { filter: drop-shadow(0 0 2px currentColor) drop-shadow(0 0 3px currentColor); }
+.bm-svg .bm-edge.glow { stroke-opacity: 1; }
 .bm-row.on-path:not(.active) .bm-row-title { color: var(--fg); }
 .bm-glyph { color: var(--muted); }
 .bm-svg .bm-gap { fill: var(--muted); opacity: 0; transition: opacity .12s; }

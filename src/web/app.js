@@ -1720,18 +1720,28 @@
         d = "M" + px + "," + py + " C" + px + "," + (py + bend * 0.6) + " " + x + "," + (py + bend * 0.4) + " " + x + "," + (py + bend) +
           " L" + x + "," + y;
       }
-      parts.push('<path d="' + d + '" fill="none" stroke="' + c + '" stroke-width="' + w + '" stroke-opacity="' + (on ? 1 : 0.6) +
+      parts.push('<path class="bm-edge" data-thread="' + MD.escape(n.thread) + '" style="color:' + c + '" d="' + d + '" fill="none" stroke="' + c + '" stroke-width="' + w + '" stroke-opacity="' + (on ? 1 : 0.6) +
         '"' + dash + ' stroke-linecap="round">' + (n.hidden ? "<title>" + MD.escape(n.hidden + " folded message" + (n.hidden === 1 ? "" : "s")) + "</title>" : "") + "</path>");
       if (n.hidden && !mini) {
         // folded straight-line commits: a count shown only while hovering the graph
         parts.push('<text class="bm-gap" x="' + (x + 4) + '" y="' + ((Math.max(py + 16, y - 14) + y) / 2) + '" font-size="9">·' + n.hidden + "</text>");
       }
     });
+    if (!mini) {
+      // hover bands: drawn first (behind everything) so a hovered row's highlight runs from the node into its label
+      var bands = g.nodes.map(function (n, i) {
+        return '<rect class="bm-band" data-band="' + MD.escape(n.id) + '" x="0" y="' + (L.ys[i] - n._h / 2) + '" width="' + L.width +
+          '" height="' + n._h + '"/>';
+      });
+      parts.unshift.apply(parts, bands);
+    }
     g.nodes.forEach(function (n, i) {
       var x = L.x(n.lane), y = L.ys[i], c = col(n.thread), b = threads.get(n.thread);
       var isTip = n.id === ap.tipId;
       var r = n.start ? (mini ? 2.8 : 4.2) : (mini ? 2 : 3);
-      var s = "";
+      // an invisible, larger hit target so the node is easy to hover / click
+      var s = mini ? "" : '<circle class="bm-hit" cx="' + x + '" cy="' + y + '" r="9" fill="transparent"/>' +
+        '<circle class="bm-hl" cx="' + x + '" cy="' + y + '" r="' + (r + 3.5) + '" fill="none" stroke="' + c + '" stroke-width="1.5"/>';
       if (isTip) s += '<circle cx="' + x + '" cy="' + y + '" r="' + (r + (mini ? 3 : 4)) + '" fill="' + c + '" fill-opacity="0.28" class="bm-here"/>';
       if (n.start || isTip) s += '<circle cx="' + x + '" cy="' + y + '" r="' + r + '" fill="' + (n.fresh ? "var(--panel)" : c) + '" stroke="' + (n.fresh ? c : "var(--panel)") +
         '" stroke-width="' + (n.fresh ? 1.8 : 1.2) + '"' + (n.fresh ? ' stroke-dasharray="1.8 1.2"' : "") + "/>";
@@ -1741,10 +1751,11 @@
         s += '<text x="' + (x + (mini ? 3 : 6)) + '" y="' + (y - (mini ? 2 : 4)) + '" font-size="' + (mini ? 7 : 9) + '" fill="#d4a017" class="bm-main-star">★</text>';
       }
       if (n.edit && !mini) s += '<text x="' + (x + 5) + '" y="' + (y + 9) + '" font-size="9" fill="' + c + '">↺</text>';
-      parts.push('<g class="bm-node" data-node="' + MD.escape(n.id) + '" data-thread="' + MD.escape(n.thread) + '"><title>' +
+      parts.push('<g class="bm-node" style="color:' + c + '" data-node="' + MD.escape(n.id) + '" data-thread="' + MD.escape(n.thread) + '"><title>' +
         MD.escape(graphNodeTitle(n, b)) + "</title>" + s + "</g>");
     });
-    return '<svg xmlns="http://www.w3.org/2000/svg" width="' + L.width + '" height="' + L.height +
+    var k = opts.scale || 1;
+    return '<svg xmlns="http://www.w3.org/2000/svg" width="' + L.width * k + '" height="' + L.height * k +
       '" viewBox="0 0 ' + L.width + " " + L.height + '">' + parts.join("") + "</svg>";
   }
 
@@ -1814,7 +1825,7 @@
       c.minimapEl.onkeydown = function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setMinimapExpanded(true); } };
       c.minimapEl.append(
         el("div", { class: "bm-mini-head" }, el("span", { text: "⑂ " + list.length }), el("span", { text: "◂" })),
-        el("div", { class: "bm-svg", html: buildGraphSvg(g, threads, colorMap, ap, { rowH: 10, padX: 6, laneW: 8, mini: true }) }));
+        el("div", { class: "bm-svg", html: buildGraphSvg(g, threads, colorMap, ap, { rowH: 10, padX: 6, laneW: 8, mini: true, scale: 1.5 }) }));
       return;
     }
 
@@ -1829,6 +1840,29 @@
     var opts = { rowH: 36, rowHSmall: 20, padX: 10, laneW: 14, mini: false };
     var svg = el("div", { class: "bm-svg", html: buildGraphSvg(g, threads, colorMap, ap, opts) });
     var rows = el("div", { class: "bm-rows" });
+    var nodeById = new Map(g.nodes.map(function (n) { return [n.id, n]; }));
+    var wrap = el("div", { class: "bm-graph-wrap" }, svg, rows);
+    var hovered = null;
+    // hovering a node or its label highlights that row (node + label) and makes the whole thread's nodes and edges glow
+    function setHover(n) {
+      if (n === hovered) return;
+      hovered = n;
+      wrap.querySelectorAll(".glow, .hover, .hl, .on").forEach(function (e) { e.classList.remove("glow", "hover", "hl", "on"); });
+      if (!n) return;
+      wrap.querySelectorAll('.bm-svg [data-thread="' + n.thread + '"]').forEach(function (e) { e.classList.add("glow"); });
+      var q = function (sel) { return wrap.querySelector(sel); };
+      var row = q('.bm-row[data-node="' + n.id + '"]'), node = q('.bm-node[data-node="' + n.id + '"]'), band = q('.bm-band[data-band="' + n.id + '"]');
+      if (row) row.classList.add("hover");
+      if (node) node.classList.add("hl");
+      if (band) band.classList.add("on");
+    }
+    function svgNode(e) {
+      var gEl = e.target.closest && e.target.closest(".bm-node");
+      return gEl ? nodeById.get(gEl.getAttribute("data-node")) || null : null;
+    }
+    svg.addEventListener("mouseover", function (e) { setHover(svgNode(e)); });
+    svg.addEventListener("mouseleave", function () { setHover(null); });
+    svg.addEventListener("click", function (e) { var n = svgNode(e); if (n) gotoGraphNode(n); });
     function threadActs(b) {
       var href = threadHref(c.id, b.id);
       return el("div", { class: "bm-row-acts" },
@@ -1868,8 +1902,8 @@
           e.preventDefault();
           gotoGraphNode(n);
         },
-        onmouseenter: function () { markThreadHover(rows, n.thread, true); },
-        onmouseleave: function () { markThreadHover(rows, n.thread, false); } },
+        onmouseenter: function () { setHover(n); },
+        onmouseleave: function () { setHover(null); } },
         label, threadActs(b));
       rows.append(row);
     });
@@ -1884,12 +1918,7 @@
           // stopPropagation: the re-render installs the minimal mode's "expand" onclick on the
           // aside this click is still bubbling to, which would immediately re-expand it
           onclick: function (e) { e.stopPropagation(); setMinimapExpanded(false); } })),
-      el("div", { class: "bm-body" }, el("div", { class: "bm-graph-wrap" }, svg, rows)));
-  }
-
-  // hovering any node of a thread shows that thread's controls on all of its rows
-  function markThreadHover(rows, bid, on) {
-    rows.querySelectorAll('.bm-row[data-branch-id="' + bid + '"]').forEach(function (r) { r.classList.toggle("thread-hover", on); });
+      el("div", { class: "bm-body" }, wrap));
   }
 
   function decorateBranchCard(card, b) {

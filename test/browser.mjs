@@ -398,6 +398,7 @@ step("spatial view: modes by width, sideways navigation, collapsed history, ★ 
 // freshly re-rendered minimal strip, whose own click handler would re-expand it)
 await p1.evaluate(() => { if (window.SFHApp.current.minimapExpanded) document.querySelector(".branch-minimap.expanded .bm-head .icon-btn").click(); });
 await waitFor(p1, () => document.querySelector(".branch-minimap.minimal:not([hidden])"), "minimal minimap", 5000);
+if (process.env.SHOT) await p1.screenshot({ path: process.env.SHOT.replace(/\.png$/, "-mini.png") });
 await p1.click(".branch-minimap.minimal");
 await waitFor(p1, () => document.querySelector(".branch-minimap.expanded .bm-head .icon-btn"), "minimap expanded by a click", 5000);
 // git graph: a row per kept node, the viewed thread's tip marked, a node on another thread opens that thread
@@ -406,7 +407,18 @@ await waitFor(p1, () => {
   return g && rows.length === g.nodes.length && document.querySelectorAll(".branch-minimap .bm-node").length === g.nodes.length &&
     document.querySelector(".branch-minimap .bm-row.active") && document.querySelector(".branch-minimap .bm-here");
 }, "graph rows match the server's nodes", 5000);
+// hovering a node highlights its row + makes its thread glow; hovering a label highlights its node
+const hv = await p1.evaluate(() => { const n = window.SFHApp.current.branches.graph.nodes.find((x) => x.start && x.parent); return { id: n.id, thread: n.thread }; });
+await p1.hover('.branch-minimap .bm-node[data-node="' + hv.id + '"] .bm-hit');
+await waitFor(p1, (h) => document.querySelector('.bm-row.hover[data-node="' + h.id + '"]') && document.querySelector('.bm-node.hl[data-node="' + h.id + '"]') &&
+  document.querySelector('.bm-band.on[data-band="' + h.id + '"]') && document.querySelector('.bm-edge.glow[data-thread="' + h.thread + '"]') &&
+  [...document.querySelectorAll(".bm-svg .glow")].every((e) => e.getAttribute("data-thread") === h.thread) &&
+  document.querySelectorAll(".bm-row.hover").length === 1, "node hover: row highlight + thread glow", 5000, hv);
 if (process.env.SHOT) await p1.screenshot({ path: process.env.SHOT });
+const first0 = await p1.evaluate(() => window.SFHApp.current.branches.graph.nodes[0].id);
+await p1.hover('.branch-minimap .bm-row[data-node="' + first0 + '"]');
+await waitFor(p1, (f) => document.querySelector('.bm-node.hl[data-node="' + f + '"]') && document.querySelectorAll(".bm-node.hl").length === 1,
+  "label hover highlights its node", 5000, first0);
 const other = await p1.evaluate(() => {
   const c = window.SFHApp.current, n = c.branches.graph.nodes.find((x) => x.mid != null && x.thread !== c.branchId && !c.messages.some((m) => m.id === x.mid));
   return n && { id: n.id, thread: n.thread, mid: n.mid };
