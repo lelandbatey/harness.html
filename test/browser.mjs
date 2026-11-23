@@ -415,6 +415,18 @@ await waitFor(p1, (h) => document.querySelector('.bm-row.hover[data-node="' + h.
   [...document.querySelectorAll(".bm-svg .glow")].every((e) => e.getAttribute("data-thread") === h.thread) &&
   document.querySelectorAll(".bm-row.hover").length === 1, "node hover: row highlight + thread glow", 5000, hv);
 if (process.env.SHOT) await p1.screenshot({ path: process.env.SHOT });
+// the expanded sidebar resizes from its left edge; the width is remembered; double-click resets it
+const rz = await p1.evaluate(() => { const r = document.querySelector(".branch-minimap.expanded .bm-resize").getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + 80 }; });
+const w0 = await p1.evaluate(() => document.querySelector(".branch-minimap.expanded").getBoundingClientRect().width);
+await p1.mouse.move(rz.x, rz.y);
+await p1.mouse.down();
+await p1.mouse.move(rz.x - 60, rz.y, { steps: 3 });
+await p1.mouse.move(rz.x - 120, rz.y, { steps: 3 });
+await p1.mouse.up();
+await waitFor(p1, (w) => Math.abs(document.querySelector(".branch-minimap.expanded").getBoundingClientRect().width - (w + 120)) < 3 &&
+  Math.abs(JSON.parse(localStorage.getItem(Object.keys(localStorage).find((k) => /bmWidth/.test(k)))) - (w + 120)) < 3, "drag widens the graph sidebar", 5000, w0);
+await p1.evaluate(() => document.querySelector(".branch-minimap.expanded .bm-resize").dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+await waitFor(p1, (w) => Math.abs(document.querySelector(".branch-minimap.expanded").getBoundingClientRect().width - w) < 1, "double-click resets the width", 5000, w0);
 const first0 = await p1.evaluate(() => window.SFHApp.current.branches.graph.nodes[0].id);
 await p1.hover('.branch-minimap .bm-row[data-node="' + first0 + '"]');
 await waitFor(p1, (f) => document.querySelector('.bm-node.hl[data-node="' + f + '"]') && document.querySelectorAll(".bm-node.hl").length === 1,

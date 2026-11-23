@@ -1818,6 +1818,7 @@
     // Mode A (default): Sublime Text-like translucent strip with the same graph minus labels; a click expands it
     if (!c.minimapExpanded) {
       c.minimapEl.className = "branch-minimap minimal";
+      c.minimapEl.style.removeProperty("width");
       c.minimapEl.tabIndex = 0;
       c.minimapEl.setAttribute("role", "button");
       c.minimapEl.title = "Thread graph (" + list.length + " threads) — click to open the sidebar";
@@ -1837,6 +1838,7 @@
     c.minimapEl.onclick = null;
     c.minimapEl.onkeydown = null;
 
+    setBmWidth(c.minimapEl, LS.get("bmWidth", null));
     var opts = { rowH: 36, rowHSmall: 20, padX: 10, laneW: 14, mini: false };
     var svg = el("div", { class: "bm-svg", html: buildGraphSvg(g, threads, colorMap, ap, opts) });
     var rows = el("div", { class: "bm-rows" });
@@ -1918,7 +1920,58 @@
           // stopPropagation: the re-render installs the minimal mode's "expand" onclick on the
           // aside this click is still bubbling to, which would immediately re-expand it
           onclick: function (e) { e.stopPropagation(); setMinimapExpanded(false); } })),
-      el("div", { class: "bm-body" }, wrap));
+      el("div", { class: "bm-body" }, wrap),
+      bmResizeHandle(c.minimapEl));
+  }
+
+  // the expanded graph sidebar is resizable from its left edge (like the left sidebar: drag, arrows, double-click resets)
+  var BM_DEFAULT = 260, BM_MIN = 200;  // BM_DEFAULT = .branch-minimap.expanded width in app.css
+  function bmMax() { return Math.max(BM_MIN, Math.floor(window.innerWidth * 0.6)); }
+  function setBmWidth(box, w, save) {
+    var px = w == null ? BM_DEFAULT : Math.round(Math.max(BM_MIN, Math.min(bmMax(), w)));
+    if (w == null) box.style.removeProperty("width"); else box.style.width = px + "px";
+    var h = box.querySelector(".bm-resize");
+    if (h) { h.setAttribute("aria-valuemin", BM_MIN); h.setAttribute("aria-valuemax", bmMax()); h.setAttribute("aria-valuenow", px); }
+    if (save) LS.set("bmWidth", w == null ? null : px);
+    return px;
+  }
+  function bmResizeHandle(box) {
+    var h = el("div", { class: "bm-resize", role: "separator", "aria-orientation": "vertical", tabindex: "0",
+      "aria-label": "Resize the thread graph", title: "Drag to resize · double-click to reset" });
+    var app = $("#app");
+    h.addEventListener("pointerdown", function (e) {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      var startX = e.clientX, startW = box.getBoundingClientRect().width, w = startW, done = false;
+      try { h.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      app.classList.add("bm-resizing");
+      function move(ev) { w = startW - (ev.clientX - startX); setBmWidth(box, w, false); }
+      function end() {
+        if (done) return;
+        done = true;
+        h.removeEventListener("pointermove", move);
+        h.removeEventListener("pointerup", end);
+        h.removeEventListener("pointercancel", end);
+        h.removeEventListener("lostpointercapture", end);
+        app.classList.remove("bm-resizing");
+        if (w !== startW) setBmWidth(box, w, true);
+      }
+      h.addEventListener("pointermove", move);
+      h.addEventListener("pointerup", end);
+      h.addEventListener("pointercancel", end);
+      h.addEventListener("lostpointercapture", end);
+    });
+    h.addEventListener("dblclick", function () { setBmWidth(box, null, true); });
+    h.addEventListener("keydown", function (e) {
+      var w = box.getBoundingClientRect().width, step = e.shiftKey ? 64 : 16;
+      if (e.key === "ArrowLeft") w += step;  // the handle is on the left edge: left = wider
+      else if (e.key === "ArrowRight") w -= step;
+      else return;
+      e.preventDefault();
+      setBmWidth(box, w, true);
+    });
+    setTimeout(function () { if (h.isConnected) setBmWidth(box, LS.get("bmWidth", null), false); });
+    return h;
   }
 
   function decorateBranchCard(card, b) {
