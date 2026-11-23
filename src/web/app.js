@@ -1748,6 +1748,19 @@
       '" viewBox="0 0 ' + L.width + " " + L.height + '">' + parts.join("") + "</svg>";
   }
 
+  // Without a server graph (an older server still running under a newer page): one node per thread, as before
+  function threadsOnlyGraph(list) {
+    var tree = orderThreadsTree(list), nodes = [], maxLane = 0;
+    tree.ordered.forEach(function (item, i) {
+      var b = item.b, lane = Math.min(GRAPH_MAX_LANES - 1, item.depth);
+      if (lane > maxLane) maxLane = lane;
+      nodes.push({ id: "t:" + b.id, mid: null, thread: b.id, row: i, lane: lane,
+        parent: b.parent_branch_id ? "t:" + b.parent_branch_id : null, hidden: 0, fresh: b.context_mode === "fresh",
+        start: true, tips: [b.id], edit: false, role: "", preview: (b.preview && b.preview.prompt) || "" });
+    });
+    return { nodes: nodes, lanes: maxLane + 1, main_tip: null };
+  }
+
   // Scrolls the conversation to a message (opening the collapsed inherited history if it sits there)
   function scrollToMessage(c, mid) {
     if (!c || !c.msgsEl || mid == null) return false;
@@ -1777,8 +1790,8 @@
     if (!c || !c.minimapEl) return;
     var info = c.branches;
     var list = info && info.branches ? info.branches : [];
-    var g = info && info.graph;
-    if (list.length <= 1 || !g || !g.nodes || !g.nodes.length) {
+    var g = info && info.graph && info.graph.nodes && info.graph.nodes.length ? info.graph : threadsOnlyGraph(list);
+    if (list.length <= 1 || !g.nodes.length) {
       c.minimapEl.hidden = true;
       c.minimapEl.textContent = "";
       c.minimapEl.className = "branch-minimap";
