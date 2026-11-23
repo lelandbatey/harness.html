@@ -128,15 +128,18 @@ This harness runs in server mode with an HTTP/websocket API, and has two clients
   expanded to show the full thinking/reasoning. By default, "thinking" lines are minimized so as not
   to dominate the entire screen with scrolling text.
 - The user can "branch" conversations in a more "lightweight" way than forking an entire
-  conversation as a copy. Instead the user can start an `/aside` to start a new branch from the
+  conversation as a copy. Instead the user can start an `/aside` to fork a new branch from the
   current message, then switch between branches of the conversation. How that looks is UI defined
   - An aside can turn into the new "main session" if the user just keeps chatting there
   - Agents can see the side-branches of their session, and can even talk to those branches like
-    subagents, or ask them one-shot questions like `/btw`
+    subagents, or ask them one-shot questions like users can with `/btw`
   - Agents are encouraged not to read the whole branches off to the side, only look at metadata and
     to ask the user if they should check in, or if the user proactively tells them to look.
+- Agents in a session can launch sub agents
+- Agents can communicate with other running agents in order to negotiate locks, priorities, ask
+  questions, etc
 - Durations for messages in a session indicate how long they took to run; how long thinking tokens
-  were streaming in, or how long a tool took to run, as we
+  were streaming in, or how long a tool took to run
 - The user can change which effort level, model and provider they are using, even mid-conversation, so each
   message also needs to have what model it was recorded with. When changing the model, there should
   be a way to choose/filter their choices from the list of models available
@@ -147,8 +150,17 @@ This harness runs in server mode with an HTTP/websocket API, and has two clients
   - edit
   - glob
   - skill - loads a full SKILL.md of a skill by name
-  - some kind of tool for launching subagents, subagents that when complete will signal back to the
-    parent, but otherwise the subagents run concurrently in the background
+  - tools for interacting with the branching model of conversations, which includes subagents
+    - `threads` for viewing other threads
+    - `spawn`
+      - `context='subagent'` to create a new thread with a "fresh context" and instructions
+      - `context='fork'` to create a new thread that retains the context from the parent
+    - `ask` lets an agent ask another thread (in the same session or even a different session in the
+      same repo) a question and get an immediate answer. The response is not added to the context of
+      the answering thread, so in concept this is like an agent using the `/btw` to get a quick
+      answer from another agent.
+    - `message` allows agents to talk to one another; these messages are added to the context of
+      both the sender and receiver, allowing them to intercommunicate
   - webfetch
 - Tool iterations are limited to 300 unattended steps
 - Error handling is nice:
@@ -156,9 +168,6 @@ This harness runs in server mode with an HTTP/websocket API, and has two clients
     3 times (configurable) with some jitter on the retry rate.
 - Rebuilding this project when there's data in it from a prior run will preserve that old data in
   the rebuild.
-- Agents in a session can launch sub agents
-- Agents can communicate with other running agents in order to negotiate locks, priorities, ask
-  questions, etc
 
 ## HTML client features
 
@@ -206,6 +215,23 @@ This harness runs in server mode with an HTTP/websocket API, and has two clients
   session. You can see that a branch started on a message, and you can see how many, and their
   titles. Clicking a branch goes "sideways" to that branch. The UI for a session with branches
   should show a kind of "branch minimap" so the user knows where they are.
+  - In the conversation UI, there's a spacial display of other branches and their relationship to
+    the current branch conversation. It's almost like a tree navigator, or evocative of one. Only
+    branches directly connected to the current conversation are shown spacially. By "spacially" we
+    mean that they are shown to the left and right of the conversation going down the middle of the
+    page, with lines indicating the "break" in the messages where that new session began. Related
+    branches aren't shown totally, just a small preview. Parent branches are shown on left, while
+    child branches are shown on the right. When one of these "to the side" branches are clicked,
+    there's a very fast animation which moves the clicked branch into being the "main branch" while
+    the branch we were on moves to the left-or-right in accordance with the selected branch.
+    - On wider viewports (e.g. a 4k screen), the spacial display shows much more of these connected
+      branches to the left and right. In slightly narrower viewports, maybe only some low-contrast
+      bit of the title is shown. And if the viewport is narrower even than that, just show a little
+      "node" coming off the conversation, a node requiring hover to see the text of what it goes to.
+    - These side branches should use the same UI conventions used for branching sessions:
+      - dashed lines/outlines for subagents
+      - solid lines for forks
+      - Same icons as used for the different kinds
 
 
 ## Minimal TUI features
