@@ -1,4 +1,6 @@
 """Server-side slash commands (texts sent with chat.send that start with "/")."""
+import asyncio
+
 from . import about, branches, llm, skills
 
 COMMANDS = [
@@ -8,7 +10,7 @@ COMMANDS = [
     {"name": "branches", "description": "List all branches (asides) of this session"},
     {"name": "btw", "description": "/btw <question> — ask a side question using this session's context; "
                                    "the answer is not added to the conversation"},
-    {"name": "retitle", "description": "Regenerate the session title and subjects from the whole conversation"},
+    {"name": "retitle", "description": "Regenerate this thread's title (on the main thread, also the session title and subjects)"},
     {"name": "title", "description": "/title <text> — set the session title"},
     {"name": "compact", "description": "/compact [instructions] — summarize the conversation so far; the model "
                                        "continues from the summary (frees context)"},
@@ -96,7 +98,11 @@ async def handle(server, client, sid, text, branch_id=None):
     elif name == "peers":
         notice("**Peers**\n\n```\n%s\n```" % agent.peers.peers_text(sid))
     elif name == "retitle":
-        await agent.retitle(sid)
+        # on the main thread: the session's title and the thread's; on any other thread: only that thread's
+        if bid == branches.main_id(agent.store, sid):
+            await asyncio.gather(agent.retitle(sid), branches.retitle(agent, sid, bid))
+        else:
+            await branches.retitle(agent, sid, bid)
     elif name == "compact":
         await agent.compact(sid, arg, branch_id=bid)
     elif name == "title":

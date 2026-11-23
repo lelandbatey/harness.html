@@ -652,7 +652,9 @@ class Agent:
             raise ValueError("message is not on the displayed branch")
         old_head = branches.head_of(self.store, sid, bid)
         old_text = "\n".join(b.get("text", "") for b in json.loads(row[2]) if b.get("type") == "text")
-        branches.record_edit_branch(self.store, sid, bid, message_id, old_head, old_text)
+        ebid = branches.record_edit_branch(self.store, sid, bid, message_id, old_head, old_text)
+        if ebid:
+            self.spawn(branches.retitle(self, sid, ebid))
         # the old branch stays in the db (and in `branches` as kind='edit'); the new prompt is a sibling
         branches.set_head(self.store, sid, bid, row[1])
         self.server.emit(sid, "messages.truncated", {"session_id": sid, "from_id": message_id})
@@ -741,7 +743,8 @@ class Agent:
                 first = not any(m["role"] == "user" for m in msgs_before)
                 brow = branches.get_row(self.store, sid, bid)
                 aside_first = False
-                if brow and brow[5] == "aside" and text is not None and not from_branch:
+                # a thread's first own prompt (any kind; a subagent's task arrives from its parent thread) titles it
+                if brow and text is not None and (not from_branch or brow[5] == "subagent"):
                     origin_id = brow[3]
                     own_before = msgs_before[next((i + 1 for i, m in enumerate(msgs_before) if m["id"] == origin_id), 0):] if origin_id else msgs_before
                     aside_first = not any(m["role"] == "user" and is_prompt(m["content"]) for m in own_before)

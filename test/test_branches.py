@@ -268,6 +268,8 @@ class TestBranches(unittest.TestCase):
         root_bid = self.c.call("sessions.subscribe", {"session_id": sid})["branch_id"]
         info0 = self.c.call("branches.list", {"session_id": sid})
         self.assertEqual(self.branch(info0, root_bid)["kind"], "root")
+        root_name = self.branch(info0, root_bid)["name"]
+        self.assertEqual(root_name, "initial setup")  # every thread kind gets a title (mock: from its first prompt)
         self.send_and_wait(sid, "/aside option B")
         aside_bid = self.c.call("sessions.subscribe", {"session_id": sid})["branch_id"]
         self.c.call("branches.rename", {"session_id": sid, "branch_id": aside_bid, "title": "option B"})
@@ -282,7 +284,7 @@ class TestBranches(unittest.TestCase):
         self.assertEqual(info["main_branch_id"], aside_bid)
         # like a git tag: nothing re-kinded, renamed or reordered
         self.assertEqual(self.branch(info, root_bid)["kind"], "root")
-        self.assertEqual(self.branch(info, root_bid)["name"], "Original")
+        self.assertEqual(self.branch(info, root_bid)["name"], root_name)
         self.assertEqual(self.branch(info, aside_bid)["kind"], "aside")
         self.assertEqual(self.branch(info, aside_bid)["name"], "option B")
         self.assertEqual([b["id"] for b in info["branches"]], order0)
@@ -301,7 +303,38 @@ class TestBranches(unittest.TestCase):
         self.c.call("branches.delete", {"session_id": sid, "branch_id": aside_bid})
         info = self.c.call("branches.list", {"session_id": sid})
         self.assertEqual(info["main_branch_id"], root_bid)
-        self.assertEqual(self.branch(info, root_bid)["name"], "Main")
+        self.assertEqual(self.branch(info, root_bid)["name"], root_name)
+
+    def test_thread_titles_and_retitle(self):
+        sid = self.new_session()
+        self.send_and_wait(sid, "root topic here")
+        root_bid = self.c.call("sessions.subscribe", {"session_id": sid})["branch_id"]
+        self.send_and_wait(sid, "/aside side topic")
+        aside_bid = self.c.call("sessions.subscribe", {"session_id": sid})["branch_id"]
+        info = self.c.call("branches.list", {"session_id": sid})
+        self.assertEqual(self.branch(info, aside_bid)["name"], "side topic")
+        # an edit keeps the old version as a thread titled from its own (replaced) prompt
+        self.c.call("branches.switch", {"session_id": sid, "branch_id": root_bid})
+        snap = self.c.call("sessions.subscribe", {"session_id": sid, "branch_id": root_bid})
+        first = next(m for m in snap["messages"] if m["role"] == "user")
+        self.c.call("chat.edit", {"session_id": sid, "message_id": first["id"], "text": "root topic edited"})
+        self.wait_for(lambda: any(b["kind"] == "edit" and b["name"] == "root topic here"
+                                  for b in self.c.call("branches.list", {"session_id": sid})["branches"]))
+        self.wait_for(lambda: self.c.call("sessions.subscribe", {"session_id": sid, "branch_id": root_bid})
+                      ["session"]["status"] == "idle")
+        # /retitle on a side thread: only that thread
+        self.c.call("branches.rename", {"session_id": sid, "branch_id": aside_bid, "title": "zzz"})
+        self.c.call("sessions.rename", {"session_id": sid, "title": "kept session title"})
+        self.c.call("branches.switch", {"session_id": sid, "branch_id": aside_bid})
+        self.c.call("chat.send", {"session_id": sid, "text": "/retitle"})
+        self.wait_for(lambda: self.branch(self.c.call("branches.list", {"session_id": sid}), aside_bid)["name"] == "side topic")
+        self.assertEqual(next(x for x in self.c.call("sessions.list", {}) if x["id"] == sid)["title"], "kept session title")
+        # /retitle on main: the thread and the session
+        self.c.call("branches.rename", {"session_id": sid, "branch_id": root_bid, "title": "yyy"})
+        self.c.call("branches.switch", {"session_id": sid, "branch_id": root_bid})
+        self.c.call("chat.send", {"session_id": sid, "text": "/retitle"})
+        self.wait_for(lambda: self.branch(self.c.call("branches.list", {"session_id": sid}), root_bid)["name"] == "root topic edited"
+                      and next(x for x in self.c.call("sessions.list", {}) if x["id"] == sid)["title"] != "kept session title")
 
     def test_expanded_state_syncs_across_tabs(self):
         sid = self.new_session()

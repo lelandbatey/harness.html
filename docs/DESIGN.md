@@ -1217,3 +1217,12 @@ is a commit, straight-line commits are folded away, branch starts carry the thre
 `test/test_graph.py` (the README example: kept nodes, folding, ↺, lane reuse, main on lane 0 after promotion,
 subagent anchors while running and after, placeholder tips, multiple edits, asides from main's tip).
 `test/browser.mjs`: rows match the server's nodes, node clicks switch thread or scroll, `⇥` minimizes.
+
+### Thread titles (README: "Threads each have titles calculated automatically, same as sessions")
+- `branches.retitle` titles threads of every kind (root, aside, subagent, edit) from their own messages (cheap
+  model with `BRANCH_TITLE_RULES`, else `fallback_branch_name` of the first own prompt). It runs after a thread's
+  first own prompt and first exchange (a subagent's task counts, though it arrives from its parent thread) and when
+  an edit creates an `edit` thread. Subagents' spawn descriptions are replaced by the generated title.
+- An unnamed root thread (sessions from before this) shows the session title instead of `Main`/`Original`.
+- `/retitle` on the main thread regenerates both the session title/subjects and the thread's title; on any other
+  thread only that thread's. Moving the main tag never renames anything.

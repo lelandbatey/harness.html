@@ -776,8 +776,10 @@ def tree_info(agent, sid, active_bid=None):
     with store.lock:
         brows = store.query("SELECT %s FROM branches WHERE session_id=? ORDER BY created_at, id" % BRANCH_COLS,
                             (sid,))
+        srow = store.query_one("SELECT title FROM sessions WHERE id=?", (sid,))
         mrows = store.query("SELECT id, parent_id, role, content, created_at FROM messages WHERE session_id=?",
                             (sid,))
+    session_title = (srow[0] if srow else "") or ""
     by_id = {r[0]: r for r in brows}
     if not active_bid or active_bid not in by_id:
         active_bid = main_bid
@@ -857,7 +859,7 @@ def tree_info(agent, sid, active_bid=None):
             fork_preview = _clip(_prompt_text(msg_meta[attach_id][2]), 80)
         s = {
             "id": bid,
-            "name": name or default_name(kind, is_main),
+            "name": name or (kind == "root" and session_title) or default_name(kind, is_main),
             "unnamed": not bool(name),
             "kind": kind,
             "context_mode": ctx_mode,
@@ -1043,9 +1045,10 @@ def emit_switched(agent, sid, bid, client=None):
 # --- auto-titling for aside branches ----------------------------------------------------------
 
 async def retitle(agent, sid, bid):
-    """Generates a short title for an aside branch (cheap model, or fallback_branch_name)."""
+    """Generates a short title for a thread of any kind from its own messages (cheap model, or
+    fallback_branch_name). Called after a thread's first prompt and first exchange, and by /retitle."""
     row = get_row(agent.store, sid, bid)
-    if not row or row[5] not in ("aside",):
+    if not row:
         return
     rt = agent.branch_rt(bid)
     rt.title_gen = gen = getattr(rt, "title_gen", 0) + 1
@@ -1068,7 +1071,7 @@ async def retitle(agent, sid, bid):
                         first_user = t
     if not first_user:
         return
-    title = fallback_branch_name(first_user) or "Aside"
+    title = fallback_branch_name(first_user) or row[2] or default_name(row[5], False)
     settings = agent.settings()
     try:
         provider, _ = agent.session_llm(sid, settings)
