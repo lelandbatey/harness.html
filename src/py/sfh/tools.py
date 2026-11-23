@@ -57,30 +57,53 @@ DEFINITIONS = [
          "format": {"type": "string", "enum": ["markdown", "text", "html"]},
          "timeout": {"type": "integer", "description": "Seconds (default 30, max 120)"}},
          "required": ["url"]}},
-    {"name": "subagent",
-     "description": "Launch a subagent: a separate background session (same cwd and tools) that works on a task "
-                    "independently. Returns immediately with the child's session_id; when the child finishes, its "
-                    "final message arrives as a <subagent-result> user message. Launch several for parallel work. "
-                    "Pass session_id to send a follow-up prompt to an existing child.",
-     "input_schema": {"type": "object", "properties": {
-         "description": {"type": "string", "description": "Short (3-5 words) description of the task"},
-         "prompt": {"type": "string", "description": "The full, self-contained task for the subagent"},
-         "session_id": {"type": "string", "description": "Continue an existing child session"}},
-         "required": ["description", "prompt"]}},
-    {"name": "peers",
-     "description": "List the other sessions active in this repository right now (running, or active in the last "
-                    "15 minutes): their title, status, what they are doing, the files they claimed and recently "
-                    "edited, and your own claims. Check this before you start changing files, and again before "
-                    "editing a file you haven't touched yet, so you don't overwrite or conflict with another "
-                    "session's work. If a peer works on the same files, adjust your plan first (other files, a "
-                    "narrower change, or later); use send_message only for information you can't get otherwise.",
+    {"name": "threads",
+     "description": "List all other threads you can see: (1) branches and subagents inside this session "
+                    "(metadata only: id, title, kind, fresh/fork context, status, message count) and "
+                    "(2) other active peer sessions in this repository (status, activity, claimed and recently "
+                    "edited files, plus your own claims). Check this before editing files so you don't conflict "
+                    "with peers. For user-owned side-branches (asides), inspect metadata only and ask the user "
+                    "before querying or messaging one unless the user asked you to.",
      "input_schema": {"type": "object", "properties": {}}},
+    {"name": "spawn",
+     "description": "Spawn a background subagent thread inside this session to work on a task concurrently. "
+                    "Choose context='fresh' (default, clean isolated context) or context='fork' (inherits "
+                    "this conversation's prior context). Returns immediately with the new thread_id; when it "
+                    "finishes, its final report arrives as a <thread-message>. Launch several for parallel work. "
+                    "To follow up with an existing thread later, use `ask` or `message`.",
+     "input_schema": {"type": "object", "properties": {
+         "description": {"type": "string", "description": "Short (3-5 words) title for the subagent thread"},
+         "prompt": {"type": "string", "description": "The full task for the subagent"},
+         "context": {"type": "string", "enum": ["fresh", "fork"],
+                     "description": "'fresh' (default, clean context) or 'fork' (inherits conversation up to here)"}},
+         "required": ["description", "prompt"]}},
+    {"name": "ask",
+     "description": "Ask a quick one-shot read-only question (like /btw) answered immediately from ANY other "
+                    "thread's context — a branch or subagent in this session, OR an active/idle peer session "
+                    "in this repository — without modifying that thread's history or running tools there. "
+                    "For user side-branches (asides), only use when the user asked you to check or agreed.",
+     "input_schema": {"type": "object", "properties": {
+         "target_id": {"type": "string", "description": "Thread/branch id (b_…), branch name, or peer session id (s_…)"},
+         "question": {"type": "string", "description": "Specific question to answer from that thread's context"}},
+         "required": ["target_id", "question"]}},
+    {"name": "message",
+     "description": "Send an asynchronous message or task to another thread — a subagent or branch in this "
+                    "session (starts a background turn with tools and delivers its result back as a "
+                    "<thread-message>), or a peer session in this repository (delivered at its step boundary; "
+                    "use `ask` instead if you just want an immediate read-only answer from an idle peer). "
+                    "For user side-branches, only use when the user asked you to or agreed.",
+     "input_schema": {"type": "object", "properties": {
+         "target_id": {"type": "string", "description": "Thread/branch id (b_…), branch name, or peer session id (s_…)"},
+         "text": {"type": "string", "description": "The task, question, reply or note to send"},
+         "kind": {"type": "string", "enum": ["task", "question", "reply", "info"],
+                  "description": "task delegates work (default for local threads); question/reply/info for peers"},
+         "reply_to": {"type": "string", "description": "For peer replies: the id (pm_…) you are answering"}},
+         "required": ["target_id", "text"]}},
     {"name": "claim",
      "description": "Mark files or directories you are about to change, with a short note on what you are doing, "
-                    "so other sessions avoid them. Advisory; expires automatically (default 30 min). Claim before "
-                    "multi-step edits and release when done (edit/write also claim the file for 10 min on their "
-                    "own). If a path is already claimed by another session, don't edit it: work around it, or ask "
-                    "the owner with send_message if you can't continue without it.",
+                    "so other threads/sessions avoid them. Advisory; expires automatically (default 30 min). "
+                    "Claim before multi-step edits and release when done (edit/write also auto-claim for 10 min). "
+                    "If a path is already claimed by another thread/session, work around it or use `ask`/`message`.",
      "input_schema": {"type": "object", "properties": {
          "paths": {"type": "array", "items": {"type": "string"}, "description": "Files or directories"},
          "note": {"type": "string", "description": "What you are doing there (shown to other sessions)"},
@@ -88,24 +111,9 @@ DEFINITIONS = [
          "required": ["paths"]}},
     {"name": "release",
      "description": "Release your claims on the given paths (or all your claims when paths is omitted) once you "
-                    "are done with them, so other sessions can work there.",
+                    "are done with them, so other threads/sessions can work there.",
      "input_schema": {"type": "object", "properties": {
          "paths": {"type": "array", "items": {"type": "string"}}}}},
-    {"name": "send_message",
-     "description": "Send a short message to another session (see `peers`). Use it to ask a question you can't "
-                    "answer yourself (e.g. \"are you changing the Runtime signature?\"), to tell a session about a "
-                    "conflict you can't avoid, or to answer a question it asked you (pass reply_to). Not for status "
-                    "updates or chatter: `peers` already shows what everyone is doing. The message reaches the "
-                    "recipient between its steps; replies arrive later as <peer-message> in your conversation. "
-                    "Don't wait for them: continue with work that doesn't depend on the answer. Keep messages "
-                    "specific and self-contained.",
-     "input_schema": {"type": "object", "properties": {
-         "session_id": {"type": "string", "description": "The recipient session"},
-         "text": {"type": "string"},
-         "kind": {"type": "string", "enum": ["question", "reply", "info"],
-                  "description": "question expects an answer; reply answers one (with reply_to); info needs none"},
-         "reply_to": {"type": "string", "description": "The id (pm_...) of the message you are answering"}},
-         "required": ["session_id", "text"]}},
 ]
 
 
@@ -121,6 +129,7 @@ class Context:
         self.load_skill = load_skill
         self.subagent = None     # callable(description, prompt, session_id) -> text; None in child sessions
         self.peer = None         # peers.ToolBridge
+        self.branch = None       # branches.ToolBridge
         self.procs = set()
         self.cancelled = False
         self.lock = threading.Lock()
@@ -314,7 +323,15 @@ def tool_webfetch(ctx, url, format="markdown", timeout=30):
         raise ToolError(str(e))
 
 
-def tool_subagent(ctx, description, prompt, session_id=None):
+def tool_subagent(ctx, description, prompt, session_id=None, context="fresh"):
+    """Backwards-compatible alias for `spawn` (or `message` when continuing an existing thread/session)."""
+    if session_id:
+        if ctx.branch:
+            return ctx.branch.message(session_id, prompt, "task", None)
+        if ctx.subagent:
+            return ctx.subagent(description, prompt, session_id)
+    if ctx.branch:
+        return ctx.branch.spawn(description, prompt, context)
     if not ctx.subagent:
         raise ToolError("subagents are not available here (subagents cannot launch subagents)")
     return ctx.subagent(description, prompt, session_id)
@@ -340,3 +357,38 @@ def tool_release(ctx, paths=None):
 
 def tool_send_message(ctx, session_id, text, kind=None, reply_to=None):
     return _peer(ctx).send(session_id, text, kind, reply_to)
+
+
+def _branch(ctx):
+    if not ctx.branch:
+        raise ToolError("thread tools are not available here")
+    return ctx.branch
+
+
+def tool_threads(ctx):
+    return _branch(ctx).list_threads()
+
+
+def tool_spawn(ctx, description, prompt, context="fresh"):
+    return _branch(ctx).spawn(description, prompt, context)
+
+
+def tool_ask(ctx, target_id, question):
+    return _branch(ctx).ask(target_id, question)
+
+
+def tool_message(ctx, target_id, text, kind=None, reply_to=None):
+    return _branch(ctx).message(target_id, text, kind, reply_to)
+
+
+# Backwards-compatible aliases
+def tool_branches(ctx):
+    return _branch(ctx).list_branches()
+
+
+def tool_ask_branch(ctx, branch_id, question):
+    return _branch(ctx).ask(branch_id, question)
+
+
+def tool_message_branch(ctx, branch_id, prompt):
+    return _branch(ctx).message(branch_id, prompt, "task", None)

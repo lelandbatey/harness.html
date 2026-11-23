@@ -46,3 +46,4 @@ and add a row below.
 | [032](032-pricing-backfill.md) | Re-price sessions recorded before price lists were used? | open |
 | [033](033-peer-sessions.md) | Peer sessions: scope, waking, storage, refusals, @ mentions | open |
 | [034](034-self-explaining-onboarding.md) | Self-explaining startup / onboarding states | done |
+| [035](035-branching-aside.md) | Lightweight conversation branching (`/aside`): auto-promotion, sync, edits, minimap | open |

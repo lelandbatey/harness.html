@@ -168,20 +168,35 @@ class TestPeers(unittest.TestCase):
 
     def test_question_wakes_idle_subagent_without_reporting_to_parent(self):
         parent = self.new_session()
+        main_bid = self.c.call("branches.list", {"session_id": parent})["main_branch_id"]
         self.c.call("chat.send", {"session_id": parent, "text": "[[subagent:child task]]"})
-        child = self.wait_for(lambda: next((s for s in self.c.call("sessions.list") if s["parent_id"] == parent), None))
+        child = self.wait_for(lambda: next((b for b in self.c.call("branches.list", {"session_id": parent})["branches"]
+                                            if b["kind"] == "subagent"), None))
         cid = child["id"]
-        self.wait_for(lambda: self.summary(cid)["status"] == "idle" and self.summary(parent)["status"] == "idle"
-                      and any("<subagent-result" in texts(m) for m in self.messages(parent)))
-        n_parent = len(self.messages(parent))
+        self.wait_for(lambda: self.summary(parent)["status"] == "idle"
+                      and any("<thread-message" in texts(m) for m in self.messages(parent)))
+        n_parent = len(self.c.call("sessions.subscribe", {"session_id": parent, "branch_id": main_bid})["messages"])
         other = self.new_session()
-        r = self.results(self.run_turn(other, tool("send_message", session_id=cid, text="what did you find?")))
+        # Unified `message` to a peer's subagent thread wakes it without triggering another report to parent
+        r = self.results(self.run_turn(other, tool("message", target_id=cid, text="what did you find?", kind="question")))
+        self.assertFalse(r[0]["is_error"], r)
         self.assertIn("starts a turn to answer", r[0]["content"])
-        self.wait_for(lambda: self.blocks(cid, "peer_message") and self.summary(cid)["status"] == "idle"
-                      and self.messages(cid)[-1]["role"] == "assistant")
-        self.assertIn("Mock reply", texts(self.messages(cid)[-1]))
-        time.sleep(0.5)
-        self.assertEqual(len(self.messages(parent)), n_parent)  # no second <subagent-result>
+        self.wait_for(lambda: self.summary(parent)["status"] == "idle" and
+                      len(self.c.call("sessions.subscribe", {"session_id": parent, "branch_id": cid})["messages"]) >= 4)
+        time.sleep(0.4)
+        self.assertEqual(len(self.c.call("sessions.subscribe", {"session_id": parent, "branch_id": main_bid})["messages"]), n_parent)
+
+    def test_ask_answers_immediately_from_idle_peer_without_gating(self):
+        a, b = self.new_session(), self.new_session()
+        self.run_turn(a, "secret peer fact PENGUIN-99")
+        n_before = len(self.messages(a))
+        # Unified `ask` works immediately on an idle top-level peer session without requiring "Let it answer"
+        r = self.results(self.run_turn(b, tool("ask", target_id=a, question="[[history]] what is the fact?")))
+        self.assertFalse(r[0]["is_error"], r)
+        self.assertIn("History: 3 messages", r[0]["content"])
+        self.assertIn("PENGUIN-99", r[0]["content"])
+        # Peer session's transcript was NOT mutated
+        self.assertEqual(len(self.messages(a)), n_before)
 
     def test_message_reaches_running_session_between_steps(self):
         a, b = self.new_session(), self.new_session()

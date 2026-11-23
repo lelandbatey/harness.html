@@ -15,7 +15,7 @@ import urllib.parse
 
 from tremolo import Application
 
-from . import about, agent as agentmod, commands, common, creds as credsmod, htmlfile, llm, pty_ws, skills
+from . import about, agent as agentmod, branches, commands, common, creds as credsmod, htmlfile, llm, pty_ws, skills
 from .store import Store, set_token as store_set_token
 
 CORS_HEADERS = {"Access-Control-Allow-Headers": "content-type, x-sfh-path, x-sfh-token",
@@ -41,6 +41,7 @@ class Client:
         self.ws = websocket
         self.kind = kind
         self.subs = set()
+        self.branch_of = {}  # session_id -> branch_id currently viewed by this client/tab
         self.q = asyncio.Queue()
         self.closed = False
         self.task = asyncio.ensure_future(self._writer())
@@ -217,11 +218,19 @@ class Server:
 
     def offline_snapshot(self):
         settings = self.store.settings()
-        sessions = [dict(s, status="idle") for s in self.agent.list()]
-        return json.dumps({"saved_at": int(time.time() * 1000), "version": common.VERSION, "sessions": sessions,
-                           "has_history": self.has_history(),
-                           "messages": {s["id"]: self.agent.messages(s["id"]) for s in sessions},
-                           "settings": {k: settings.get(k) for k in OFFLINE_SETTINGS}}).encode("utf-8")
+        sessions = [dict(s, status="idle", active_status="idle") for s in self.agent.list()]
+        branch_data = {}
+        for s in sessions:
+            bd = branches.all_branch_data(self.agent, s["id"])
+            if bd:
+                branch_data[s["id"]] = bd
+        snap = {"saved_at": int(time.time() * 1000), "version": common.VERSION, "sessions": sessions,
+                "has_history": self.has_history(),
+                "messages": {s["id"]: self.agent.messages(s["id"]) for s in sessions},
+                "settings": {k: settings.get(k) for k in OFFLINE_SETTINGS}}
+        if branch_data:
+            snap["branches"] = branch_data
+        return json.dumps(snap).encode("utf-8")
 
     # --- RPC -----------------------------------------------------------------------------------
 
@@ -260,11 +269,16 @@ class Server:
         if method == "fs.list":
             return list_dir(p.get("path"), bool(p.get("hidden")), a.default_cwd())
         if method == "sessions.subscribe":
-            snap = a.snapshot(p["session_id"])
-            client.subs.add(p["session_id"])
+            sid = p["session_id"]
+            bid = branches.resolve(self.store, sid, p["branch_id"]) if p.get("branch_id") else branches.active_id(self.store, sid)
+            snap = a.snapshot(sid, branch_id=bid)
+            client.subs.add(sid)
+            client.branch_of[sid] = bid
             return snap
         if method == "sessions.unsubscribe":
-            client.subs.discard(p.get("session_id"))
+            sid = p.get("session_id")
+            client.subs.discard(sid)
+            client.branch_of.pop(sid, None)
             return True
         if method == "sessions.rename":
             return a.rename(p["session_id"], p.get("title") or "")
@@ -272,6 +286,7 @@ class Server:
             await a.delete(p["session_id"])
             for c in self.clients:
                 c.subs.discard(p["session_id"])
+                c.branch_of.pop(p["session_id"], None)
             self.onboarding_changed()
             return True
         if method == "chat.send":
@@ -279,14 +294,17 @@ class Server:
             a.require(sid)
             if not text.strip():
                 raise ValueError("empty message")
+            bid = p.get("branch_id") or client.branch_of.get(sid) or a.active_branch(sid)
             if commands.is_command(text):
-                await commands.handle(self, client, sid, text)
+                await commands.handle(self, client, sid, text, branch_id=bid)
                 return {"queued": False}
             self.require_provider()
-            return {"queued": await a.send(sid, text)}
+            return {"queued": await a.send(sid, text, branch_id=bid)}
         if method == "chat.edit":
             self.require_provider()
-            await a.edit(p["session_id"], int(p["message_id"]), str(p.get("text") or ""))
+            sid = p["session_id"]
+            bid = p.get("branch_id") or client.branch_of.get(sid) or a.active_branch(sid)
+            await a.edit(sid, int(p["message_id"]), str(p.get("text") or ""), branch_id=bid)
             return True
         if method == "peers.list":
             a.require(p["session_id"])
@@ -295,9 +313,39 @@ class Server:
             self.require_provider()
             return {"started": a.deliver_inbox(p["session_id"])}
         if method == "chat.stop":
-            a.require(p["session_id"])
-            await a.stop(p["session_id"])
+            sid = p["session_id"]
+            a.require(sid)
+            bid = p.get("branch_id") or client.branch_of.get(sid) or a.active_branch(sid)
+            await a.stop_branch(sid, bid)
             return True
+        if method == "branches.list":
+            sid = p["session_id"]
+            a.require(sid)
+            bid = p.get("branch_id") or client.branch_of.get(sid)
+            return branches.tree_info(a, sid, active_bid=bid)
+        if method == "branches.create":
+            sid = p["session_id"]
+            prompt = (p.get("prompt") or "").strip()
+            if prompt:
+                self.require_provider()
+            from_mid = p.get("from_message_id")
+            title = p.get("title") or (branches.fallback_branch_name(prompt) if prompt else "")
+            pbid = p.get("parent_branch_id") or client.branch_of.get(sid)
+            b = branches.create(a, sid, from_message_id=from_mid, title=title,
+                                kind=p.get("kind") or "aside", switch=p.get("switch", True),
+                                parent_branch_id=pbid, context_mode=p.get("context_mode") or "fork",
+                                client=client)
+            if prompt:
+                await a.send(sid, prompt, branch_id=b["id"])
+            return {"branch": b, "snapshot": a.snapshot(sid, branch_id=b["id"])}
+        if method == "branches.switch":
+            return branches.switch(a, p["session_id"], p["branch_id"], client=client)
+        if method == "branches.rename":
+            return branches.rename(a, p["session_id"], p["branch_id"], p.get("title") or "")
+        if method == "branches.promote":
+            return branches.promote(a, p["session_id"], p["branch_id"])
+        if method == "branches.delete":
+            return await branches.delete(a, p["session_id"], p["branch_id"])
         if method == "settings.get":
             return self.store.settings()
         if method == "settings.set":

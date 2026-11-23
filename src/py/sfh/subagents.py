@@ -96,7 +96,7 @@ def turn_finished(agent, sid, rt, error=None):
     text = final_text(agent, sid)
     if status == "error" and error is not None:
         text = (text + "\n\n" if text else "") + "Error: %s" % error
-    description = getattr(rt, "sub_description", None) or row[1] or ""
+    description = getattr(agent.rt.get(sid), "sub_description", None) or row[1] or ""
     msg = "<subagent-result session_id=%s description=%s status=%s>%s</subagent-result>" % (
         quoteattr(sid), quoteattr(description), quoteattr(status), text)
 

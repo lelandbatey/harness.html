@@ -1,8 +1,11 @@
 """Server-side slash commands (texts sent with chat.send that start with "/")."""
-from . import about, llm, skills
+from . import about, branches, llm, skills
 
 COMMANDS = [
     {"name": "help", "description": "List the available commands"},
+    {"name": "aside", "description": "/aside [message] — start a new side-branch from the current message and switch to it"},
+    {"name": "branch", "description": "/branch [id|name|main|promote|rename <title>] — switch, promote or rename branches"},
+    {"name": "branches", "description": "List all branches (asides) of this session"},
     {"name": "btw", "description": "/btw <question> — ask a side question using this session's context; "
                                    "the answer is not added to the conversation"},
     {"name": "retitle", "description": "Regenerate the session title and subjects from the whole conversation"},
@@ -32,15 +35,16 @@ def is_command(text):
     return any(c["name"] == name for c in COMMANDS)
 
 
-async def handle(server, client, sid, text):
+async def handle(server, client, sid, text, branch_id=None):
     """Runs a command. Notices for informational commands go only to the requesting client."""
     agent = server.agent
     name, _, arg = text.lstrip()[1:].partition(" ")
     arg = arg.strip()
     session = agent.require(sid)
+    bid = branch_id or (client.branch_of.get(sid) if client else None) or branches.active_id(agent.store, sid)
 
     def notice(t, level="info", everyone=False):
-        data = {"session_id": sid, "level": level, "text": t}
+        data = {"session_id": sid, "branch_id": bid, "level": level, "text": t}
         if everyone or client is None:
             server.emit(sid, "notice", data)
         else:
@@ -50,16 +54,51 @@ async def handle(server, client, sid, text):
         return notice(llm.NO_PROVIDER, "error")
     if name == "help":
         notice("**What is this?** " + about.ABOUT["what"] + "\n\n**Commands**\n\n" + "\n".join("- `/%s` — %s" % (c["name"], c["description"]) for c in COMMANDS))
+    elif name == "aside":
+        if arg and not server.has_provider():
+            return notice(llm.NO_PROVIDER, "error")
+        b = branches.create(agent, sid, title=branches.fallback_branch_name(arg) if arg else "",
+                            parent_branch_id=bid, client=client)
+        bid = b["id"]
+        if arg:
+            await agent.send(sid, arg, branch_id=b["id"])
+        else:
+            notice("Started aside branch `%s`. Send a message here, or switch back with `/branch main`." % b["id"])
+    elif name == "branches":
+        notice("**Threads**\n\n```\n%s\n```" % branches.branches_text(agent, sid, bid))
+    elif name == "branch":
+        if not arg:
+            notice("**Threads**\n\n```\n%s\n```\n\nSwitch with `/branch <id|name|main>`, promote with `/branch promote`, "
+                   "or rename with `/branch rename <title>`." % branches.branches_text(agent, sid, bid))
+        else:
+            sub, _, rest = arg.partition(" ")
+            rest = rest.strip()
+            if sub == "promote":
+                b = branches.promote(agent, sid, rest or bid)
+                notice("Branch **%s** (`%s`) is now the main branch." % (b["name"], b["id"]), everyone=True)
+            elif sub == "rename":
+                if not rest:
+                    return notice("usage: `/branch rename <title>`", "error")
+                b = branches.rename(agent, sid, bid, rest)
+                notice("Renamed branch `%s` to **%s**." % (b["id"], b["name"]), everyone=True)
+            else:
+                try:
+                    snap = branches.switch(agent, sid, arg, client=client)
+                    bid = snap["branch_id"]
+                    b = next((x for x in snap["branches"]["branches"] if x["id"] == snap["branch_id"]), None)
+                    notice("Switched to branch **%s** (`%s`)." % (b["name"] if b else arg, snap["branch_id"]))
+                except ValueError as e:
+                    notice(str(e), "error")
     elif name == "btw":
         if not arg:
             return notice("usage: `/btw <question>`", "error")
-        agent.spawn(agent.btw(sid, arg))
+        agent.spawn(agent.btw(sid, arg, branch_id=bid))
     elif name == "peers":
         notice("**Peers**\n\n```\n%s\n```" % agent.peers.peers_text(sid))
     elif name == "retitle":
         await agent.retitle(sid)
     elif name == "compact":
-        await agent.compact(sid, arg)
+        await agent.compact(sid, arg, branch_id=bid)
     elif name == "title":
         if not arg:
             return notice("usage: `/title <text>`", "error")
@@ -112,7 +151,7 @@ async def handle(server, client, sid, text):
         notice("**Skills**\n\n" + ("\n".join("- **%s** (%s) — %s" % (s["name"], s["source"], s["description"])
                                              for s in sk) or "(none)"))
     elif name == "system":
-        notice("**Effective system prompt**\n\n````\n%s\n````" % agent.system_prompt(sid))
+        notice("**Effective system prompt**\n\n````\n%s\n````" % agent.system_prompt(sid, bid))
     else:
         notice("unknown command `/%s`" % name, "error")
 

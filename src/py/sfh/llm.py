@@ -715,6 +715,7 @@ BASH_RE = re.compile(r"\[\[bash:(.*?)\]\]", re.S)
 FLAKY_RE = re.compile(r"\[\[flaky:(\d+)\]\]")      # the first N attempts fail mid-stream (retryable)
 TOOL_RE = re.compile(r"\[\[tool:(\w+):(\{.*?\})\]\]", re.S)  # any tool call with a JSON input
 SUBAGENT_RE = re.compile(r"\[\[subagent:((?:[^\[\]]|\[\[[^\[\]]*\]\])*)\]\]", re.S)  # allows one nested [[..]]
+FORK_RE = re.compile(r"\[\[fork:((?:[^\[\]]|\[\[[^\[\]]*\]\])*)\]\]", re.S)          # forked subagent thread
 
 
 class MockStream:
@@ -749,13 +750,15 @@ class MockStream:
                 msgs.append(dict(m, content=content))
         last = msgs[-1] if msgs else {"role": "user", "content": []}
         text = last_user_text(msgs)
+        # tool/control triggers ([[bash:]], [[subagent:]], [[fork:]], [[tool:]]) only match the newest text block
+        trigger_text = next((b.get("text", "") for b in reversed(last["content"]) if b.get("type") == "text"), text)
         # tests shorten these via $SFH_MOCK_DELAY / $SFH_MOCK_SLOW_DELAY (seconds per streamed chunk)
         delay = float(os.environ.get("SFH_MOCK_SLOW_DELAY" if "[[slow]]" in text else "SFH_MOCK_DELAY",
                                      0.3 if "[[slow]]" in text else 0.02))
         results = [b for b in last["content"] if b.get("type") == "tool_result"]
-        flaky = FLAKY_RE.search(text)
+        flaky = FLAKY_RE.search(trigger_text)
         idx = 0
-        if self.effort and "[[noeffort]]" in text:  # a model that refuses effort levels
+        if self.effort and "[[noeffort]]" in trigger_text:  # a model that refuses effort levels
             raise LLMError("Mock API error 400: this model does not support the effort parameter")
         if not results:
             yield ("block", idx, {"type": "thinking", "thinking": "", "signature": ""})
@@ -767,11 +770,12 @@ class MockStream:
                 raise LLMError("mock provider not responding (attempt %d)" % (self.attempt + 1), retryable=True)
             yield ("delta", idx, "signature", "mock-signature")
             idx += 1
-            m = BASH_RE.search(text)
+            m = BASH_RE.search(trigger_text)
             calls = [("bash", {"command": m.group(1)})] if m else [
-                ("subagent", {"description": "mock task", "prompt": p}) for p in SUBAGENT_RE.findall(text)]
+                ("spawn", {"description": "mock task", "prompt": p, "context": "fresh"}) for p in SUBAGENT_RE.findall(trigger_text)] + [
+                ("spawn", {"description": "mock fork", "prompt": p, "context": "fork"}) for p in FORK_RE.findall(trigger_text)]
             if not calls:
-                calls = [(n, json.loads(j)) for n, j in TOOL_RE.findall(text)]
+                calls = [(n, json.loads(j)) for n, j in TOOL_RE.findall(trigger_text)]
             if calls:
                 for name, inp in calls:
                     tid = "toolu_mock" + os.urandom(6).hex()

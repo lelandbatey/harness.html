@@ -530,9 +530,10 @@ def user_text(msg):
 
 
 def is_prompt_msg(msg):
-    """A user message the user typed (not tool results, a delivered subagent result or a /compact summary)."""
+    """A user message the user typed (not tool results, a delivered subagent/branch result or a /compact summary)."""
+    t = user_text(msg)
     return (msg.get("role") == "user" and not is_tool_result_msg(msg) and not is_compaction_msg(msg)
-            and not is_peer_msg(msg) and not parse_subagent_result(user_text(msg)))
+            and not is_peer_msg(msg) and not parse_subagent_result(t) and not parse_branch_result(t))
 
 
 def is_peer_msg(msg):
@@ -582,6 +583,15 @@ def tool_summary(block):
     inp = inp or {}
     if name == "subagent" and isinstance(inp, dict) and isinstance(inp.get("description"), str):
         return "subagent(%s)" % inp["description"].split("\n")[0]
+    if name == "spawn" and isinstance(inp, dict):
+        ctx = inp.get("context") or "fresh"
+        return "spawn[%s](%s)" % (ctx, str(inp.get("description") or "").split("\n")[0][:60])
+    if name in ("ask", "message", "ask_branch", "message_branch") and isinstance(inp, dict):
+        tgt = inp.get("target_id") or inp.get("branch_id") or "?"
+        q = inp.get("question") or inp.get("prompt") or inp.get("text") or ""
+        return "%s(%s: %s)" % (name, tgt, str(q).split("\n")[0][:60])
+    if name in ("threads", "branches"):
+        return "%s()" % name
     if isinstance(inp, dict):
         for k in ("command", "path", "file_path", "pattern", "url", "name"):
             if isinstance(inp.get(k), str):
@@ -767,6 +777,9 @@ def render_box(title, body, width, color):
 
 SUBAGENT_RESULT_RE = re.compile(r"^<subagent-result((?:\s+[\w-]+=(?:\"[^\"]*\"|'[^']*'))*)\s*>(.*?)(?:</subagent-result>\s*)?$",
                                 re.S)
+BRANCH_RESULT_RE = re.compile(
+    r"^<(?:branch-result|thread-message)((?:\s+[\w-]+=(?:\"[^\"]*\"|'[^']*'))*)\s*>(.*?)(?:</(?:branch-result|thread-message)>\s*)?$",
+    re.S)
 
 
 def parse_subagent_result(text):
@@ -778,6 +791,32 @@ def parse_subagent_result(text):
              for k, q, dq, sq in re.findall(r"([\w-]+)=(\"([^\"]*)\"|'([^']*)')", m.group(1))}
     return {"session_id": attrs.get("session_id", ""), "description": attrs.get("description", ""),
             "status": attrs.get("status", ""), "body": m.group(2)}
+
+
+def parse_branch_result(text):
+    """{"branch_id", "title", "status", "kind", "body"} for a <thread-message> or <branch-result>, else None."""
+    m = BRANCH_RESULT_RE.match(text or "")
+    if not m:
+        return None
+    attrs = {k: html.unescape(dq if q.startswith('"') else sq)
+             for k, q, dq, sq in re.findall(r"([\w-]+)=(\"([^\"]*)\"|'([^']*)')", m.group(1))}
+    return {"branch_id": attrs.get("from") or attrs.get("branch_id", ""),
+            "title": attrs.get("title", ""),
+            "kind": attrs.get("kind", "branch"),
+            "status": attrs.get("status", ""), "body": m.group(2)}
+
+
+def render_branch_result(r, width, max_lines=6):
+    status = r["status"] or "completed"
+    kind = r.get("kind") or "branch"
+    color = RED if status == "error" else (DIM if status == "stopped" else (MAGENTA if kind == "subagent" else CYAN))
+    title = "⑂ %s %s [%s]" % (kind, r["title"] or r["branch_id"] or "?", status)
+    body = render_markdown(r["body"].strip() or "(no output)", width - 2)
+    if len(body) > max_lines:
+        body = body[:max_lines] + [styled("  … +%d lines" % (len(body) - max_lines), DIM)]
+    if r["branch_id"]:
+        body.append(styled("  " + clip("thread " + r["branch_id"] + " · /branch to switch", width - 4), DIM))
+    return render_box(title, body, width, color)
 
 
 def render_subagent_result(r, width, max_lines=6):
@@ -810,6 +849,9 @@ def render_message(msg, width, results, live=None):
         sr = parse_subagent_result(user_text(msg))
         if sr:
             return [""] + render_subagent_result(sr, width)
+        br = parse_branch_result(user_text(msg))
+        if br:
+            return [""] + render_branch_result(br, width)
         ls = wrap(user_text(msg), width - 2) or [""]
         out = [""] + [styled("❯ " if k == 0 else "  ", BOLD + CYAN) + styled(l, BOLD) for k, l in enumerate(ls)]
         v = msg.get("versions") or 1
@@ -884,8 +926,9 @@ def turn_ends(items, running=False):
 
 
 def starts_turn(msg):
-    """A typed prompt or a delivered subagent result (both start a turn of the session)."""
-    return is_prompt_msg(msg) or (msg.get("role") == "user" and bool(parse_subagent_result(user_text(msg))))
+    """A typed prompt or a delivered subagent/branch result (all start a turn of the session)."""
+    t = user_text(msg)
+    return is_prompt_msg(msg) or (msg.get("role") == "user" and (bool(parse_subagent_result(t)) or bool(parse_branch_result(t))))
 
 
 def turn_start(items):
@@ -909,12 +952,27 @@ def llm_change_label(prev, msg):
     return "⇄ " + " · ".join(parts) if parts else None
 
 
-def render_transcript(items, draft, width, cache=None, live=None, running=False):
+def _fork_line(chips, width):
+    names = ", ".join(c.get("name") or c.get("branch_id", "?") for c in chips)
+    total = sum(1 + (c.get("nested") or 0) for c in chips)
+    return styled(clip("  ⑂ %d branch%s: %s (/branch to switch)" % (total, "" if total == 1 else "es", names), width),
+                  DIM + CYAN)
+
+
+def render_transcript(items, draft, width, cache=None, live=None, running=False, branches=None):
     """live: running timers (see render_blocks); running: the session's turn is in progress."""
     results = collect_results(items)
     ends = turn_ends(items, running)
+    forks = (branches or {}).get("forks") or {}
+    blist = (branches or {}).get("branches") or []
+    active_b = next((b for b in blist if b.get("is_active")), None) if len(blist) > 1 else None
     pending = live and live.get("tools") and live.get("now")
     out = []
+    if forks.get("root"):
+        out.append(_fork_line(forks["root"], width))
+    if active_b and not active_b.get("is_main") and active_b.get("origin_id") is None:
+        out.append(styled(clip("  ── ↳ %s: %s ──" % (active_b.get("kind", "aside"), active_b.get("name", "")), width),
+                          DIM + CYAN))
     prev = None
     for i, it in enumerate(items):
         if it[0] == "msg" and it[1].get("role") == "assistant":
@@ -937,6 +995,13 @@ def render_transcript(items, draft, width, cache=None, live=None, running=False)
         out += lines
         if i in ends:
             out.append(styled(clip("  ── turn took %s" % fmt_dur(ends[i]), width), DIM))
+        if it[0] == "msg" and it[1].get("id") is not None:
+            mid = it[1]["id"]
+            if active_b and not active_b.get("is_main") and active_b.get("origin_id") == mid:
+                out.append(styled(clip("  ── ↳ %s: %s ──" % (active_b.get("kind", "aside"), active_b.get("name", "")),
+                                       width), DIM + CYAN))
+            if forks.get(str(mid)):
+                out.append(_fork_line(forks[str(mid)], width))
     if draft and draft.get("content"):
         out.append("")
         out += render_blocks(draft["content"], width, {}, live, streaming=True)
@@ -1131,6 +1196,81 @@ def provider_label(p):
     return str(p or "")
 
 
+class BranchPicker(SessionPicker):
+    """/branch without an argument: the session's branches in tree order, type to filter.
+    handle(key) returns ("branch", branch_id), ("cancel",) or None."""
+    prompt = "branch: "
+    action = "branch"
+
+    def __init__(self, branch_info, now_ms=None):
+        blist = list((branch_info or {}).get("branches") or [])
+        by_id = {b["id"]: b for b in blist}
+        kids = {}
+        roots = []
+        for b in blist:
+            p = b.get("parent_branch_id")
+            if p and p != b["id"] and p in by_id:
+                kids.setdefault(p, []).append(b)
+            else:
+                roots.append(b)
+        ordered, seen = [], set()
+
+        def walk(b, depth):
+            if b["id"] in seen:
+                return
+            seen.add(b["id"])
+            ordered.append(dict(b, _depth=depth))
+            for k in kids.get(b["id"], []):
+                walk(k, depth + 1)
+        for r in roots:
+            walk(r, 0)
+        for b in blist:
+            if b["id"] not in seen:
+                walk(b, 0)
+        self.sessions = ordered
+        self.now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+        self.query = ""
+        self.top = 0
+        self.sel = next((i for i, b in enumerate(ordered) if b.get("is_active")), 0)
+
+    @property
+    def matches(self):
+        words = self.query.lower().split()
+        return [b for b in self.sessions
+                if all(w in (b.get("name", "") + " " + b.get("id", "") + " " + b.get("kind", "")).lower()
+                       for w in words)]
+
+    def render(self, width, height):
+        m = self.matches
+        rows = [styled(self.prompt, BOLD) + self.query + styled("▏", DIM) +
+                styled("  %d/%d · ↑/↓ move · Enter switch · Esc cancel" % (len(m), len(self.sessions)), DIM)]
+        avail = max(0, height - 1)
+        if self.sel < self.top:
+            self.top = self.sel
+        elif avail and self.sel >= self.top + avail:
+            self.top = self.sel - avail + 1
+        self.top = max(0, min(self.top, max(0, len(m) - avail)))
+        for i in range(self.top, min(len(m), self.top + avail)):
+            b = m[i]
+            title = tree_prefix(b.get("_depth", 0)) + (b.get("name") or "(unnamed)")
+            tags = [b.get("kind") or "aside", "%d msgs" % b.get("own_messages", 0)]
+            if b.get("status") == "running":
+                tags.append("running")
+            if b.get("is_active"):
+                tags.append("✓ current")
+            meta = "%s · %s" % (b.get("id", ""), " · ".join(tags))
+            line = clip("%s  %s" % (title, meta), max(1, width - 2))
+            if i == self.sel:
+                rows.append(REVERSE + "❯ " + line + " " * max(0, width - 2 - str_width(line)) + RESET)
+            else:
+                t = clip(title, max(1, width - 2))
+                rows.append("  " + t + styled(line[len(t):], DIM))
+        if not m:
+            rows.append(styled("  (no matching branches)", DIM))
+        rows = rows[:max(1, height)]
+        return rows + [""] * (max(1, height) - len(rows))
+
+
 class ModelPicker(SessionPicker):
     """/model without an argument: the provider's models (from models.list), type to filter.
     handle(key) returns ("model", model_id) ("" = the provider's default), ("cancel",) or None."""
@@ -1267,6 +1407,8 @@ class App:
         self.cwd = os.path.abspath(opts.get("cwd") or os.getcwd())
         self.rpc = None
         self.session = None
+        self.branch_id = None
+        self.branches = None
         self.items = []
         self.draft = None
         self.queue = []
@@ -1466,7 +1608,13 @@ class App:
         if sid is None:
             sid = self.rpc.call("sessions.create", {"cwd": self.cwd})["id"]
         r = self.rpc.call("sessions.subscribe", {"session_id": sid})
-        self.session = r["session"]
+        self.apply_snapshot(r)
+
+    def apply_snapshot(self, r):
+        if r.get("session"):
+            self.session = r["session"]
+        self.branch_id = r.get("branch_id") or ((r.get("branches") or {}).get("active_branch_id"))
+        self.branches = r.get("branches")
         self.items = [("msg", m) for m in r.get("messages") or []]
         self.draft = r.get("draft")
         self.queue = r.get("queue") or []
@@ -1507,6 +1655,16 @@ class App:
                 self.items.append(("local", "This session was deleted by another client."))
             return
         if d.get("session_id") not in (None, sid):
+            return
+        if name == "branches.updated":
+            self.branches = d.get("branches")
+            if self.branches and self.branches.get("active_branch_id"):
+                self.branch_id = self.branches["active_branch_id"]
+            return
+        if name == "branch.switched":
+            self.apply_snapshot(d)
+            return
+        if d.get("branch_id") not in (None, self.branch_id) and self.branch_id is not None:
             return
         if name == "message.added":
             self.items.append(("msg", d))
@@ -1626,6 +1784,15 @@ class App:
                     return
                 self.picker = ModelPicker(r.get("models") or [], (self.session or {}).get("model"), r.get("provider"))
                 return
+            if cmd == "/branch" and not arg:
+                try:
+                    info = self.rpc.call("branches.list", {"session_id": self.sid()})
+                except wsclient.RPCError as e:
+                    self.flash = "listing branches failed: %s" % e
+                    return
+                self.branches = info
+                self.picker = BranchPicker(info)
+                return
             if cmd == "/edit":
                 for it in reversed(self.items):
                     if it[0] == "msg" and is_prompt_msg(it[1]):
@@ -1661,6 +1828,14 @@ class App:
                 self.flash = "model: %s" % s.get("model")
             except wsclient.RPCError as e:
                 self.flash = "setting the model failed: %s" % e
+        elif act[0] == "branch":
+            try:
+                snap = self.rpc.call("branches.switch", {"session_id": self.sid(), "branch_id": act[1]})
+                self.apply_snapshot(snap)
+                b = next((x for x in (self.branches or {}).get("branches") or [] if x["id"] == self.branch_id), None)
+                self.flash = "branch: %s" % (b["name"] if b else act[1])
+            except wsclient.RPCError as e:
+                self.flash = "switching branch failed: %s" % e
         elif act[0] == "resume":
             try:
                 self.open_session(act[1])
@@ -1763,8 +1938,10 @@ class App:
         status = s.get("status", "")
         prov = ("%s:%s" % (s["provider"], s["model"]) if s.get("provider") and s.get("model")
                 else provider_label((self.hello or {}).get("provider")))
-        head = " %s · %s · %s · effort %s · %s " % (s.get("title") or "(untitled)", s.get("id", ""),
-                                                    prov or s.get("model", ""), effort_label(s), status)
+        btag = (" · ⑂ %s (%d)" % (s.get("active_branch_name") or "Main", s.get("branch_count", 1))
+                if (s.get("branch_count") or 1) > 1 else "")
+        head = " %s%s · %s · %s · effort %s · %s " % (s.get("title") or "(untitled)", btag, s.get("id", ""),
+                                                      prov or s.get("model", ""), effort_label(s), status)
         header = REVERSE + clip(head, W) + " " * max(0, W - str_width(clip(head, W))) + RESET
         ed_rows, cr, cc = editor_view(self.editor, W, max(1, H // 3))
         sep_info = ""
@@ -1797,7 +1974,7 @@ class App:
             rows = [header] + view + [sep] + ed_rows + [footer]
             return rows[:H], (1, min(W - 1, str_width(self.picker.prompt + self.picker.query)))
         live = {"now": self.server_now(), "tools": self.tools} if status == "running" else None
-        lines = render_transcript(self.items, self.draft, W, self.cache, live, status == "running")
+        lines = render_transcript(self.items, self.draft, W, self.cache, live, status == "running", self.branches)
         if self.scroll and self.anchor and self.anchor[0] == W:
             # scrolled up: output added below must not move the view (it's counted as "more lines")
             self.scroll = max(0, self.scroll + len(lines) - self.anchor[1])

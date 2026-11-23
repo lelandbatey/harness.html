@@ -1009,3 +1009,110 @@ machine doesn't break open tabs). The web client takes the pairing token wheneve
 `test_server.TestOnboarding`, `test_tui.FirstRunTest` + `test_read_only_without_provider`,
 `test/browser_onboarding.mjs` (fake OpenAI endpoint; file:// steps 1–2, read only, #setup/#about, http copy
 with and without history, Download bytes identical, no local probes).
+
+## v16: lightweight conversation branching (`/aside`), branch minimap, agent branch tools (questions/035)
+
+README: `/aside` starts a lightweight branch from the current message without copying the whole session;
+users can switch between branches; an aside can become the new main branch if the user keeps chatting there;
+agents see side-branch metadata (encouraged not to read whole branches without asking) and can ask one-shot
+questions (`ask_branch`, like `/btw`) or delegate turns (`message_branch`, like `subagent`); HTML shows
+per-message branch indicators and a branch minimap.
+
+### Storage & concurrency (`sfh/branches.py`, migration 8)
+- `branches(id, session_id, name, origin_id, head_id, kind, created_at, updated_at)` + `sessions.active_branch_id`.
+  `messages.parent_id` already stores the message tree; `branches` tracks named tips (`kind`: `main` | `aside` | `edit`).
+  `branches.ensure(store, sid)` lazily ensures a `Main` branch (and registers pre-v16 edit leaves as `edit` branches).
+- Per-branch execution runtime `BranchRuntime` (`agent.brt[bid]`): each branch has its own `task`, `queue`,
+  `draft`, `stream`, `cancel`, `tool_ctx`, `tools`, `notify_branch`, so side-branches run concurrently with
+  the active branch (e.g. via `message_branch` or while the user switches away). `agent.rt[sid]` keeps
+  session-level peer state.
+- `sessions.head_id` stays synced with the active branch's `head_id`. Session summary gains
+  `active_branch_id`, `active_branch_name`, `active_branch_kind`, `branch_count`, `active_status` (`status`
+  is `"running"` if any branch is running). Per-branch events carry `branch_id` (except `messages.truncated`).
+- `chat.edit` registers the replaced tip as an `edit` branch before rewinding, keeping existing edit semantics intact.
+- Auto-titling: aside branches get an immediate fallback title from their first prompt, then a cheap-model
+  title (`branches.retitle`) after the first message and again after the first exchange.
+- Auto-promotion (`branches.maybe_auto_promote`): an `aside` automatically becomes the new `main` when the
+  user has sent ≥ 3 own prompts on it and it is strictly deeper past the LCA than the current `main` (old
+  `main` becomes an `aside`, kept intact; info notice emitted). Manual promotion is always available.
+
+### RPCs, events & commands
+- RPCs: `branches.list`, `branches.create {session_id, from_message_id?, title?, prompt?, switch?}`,
+  `branches.switch {session_id, branch_id}`, `branches.rename {session_id, branch_id, title}`,
+  `branches.promote {session_id, branch_id}`, `branches.delete {session_id, branch_id}` (prunes messages
+  unreferenced by remaining branches).
+- Events: `branches.updated {session_id, branches}` and `branch.switched` (full snapshot; all subscribed
+  clients switch together). `sessions.subscribe` includes `branch_id` and `branches` (`tree_info`:
+  `branches[]` + `forks{msg_id|"root": [chips]}`).
+- Commands: `/aside [message]`, `/branch [id|name|main|promote|rename <title>]`, `/branches`.
+
+### Agent awareness & tools (`sfh/branches.py`, `sfh/tools.py`)
+- Passive metadata: when other `main`/`aside` branches with messages (or running) exist,
+  `branches.system_note` appends a concise `# Session branches (metadata only)` section to the system prompt
+  (no contents, no volatile timestamps) instructing the model NOT to read/query side-branches unless asked or
+  approved by the user.
+- Tools: `branches` (live metadata only), `ask_branch(branch_id, question)` (one-shot `/btw`-style call on
+  target branch's `llm_history`, no mutation, usage tracked), `message_branch(branch_id, prompt)` (starts a
+  background turn on target branch like `subagent` and delivers `<branch-result>` back to the caller branch).
+
+### Web UI, offline view & TUI
+- Thinking blocks stay collapsed by default while streaming (`thinkingEl("", false)` in `flushDraft`).
+- Web: hover `Aside` action on user & assistant messages; inline `.branch-fork` strip below each fork message
+  showing count, lane-colored chips with title/status/counts (click switches sideways with subtle slide), and
+  `+ Aside`; `.branch-origin-div` on aside branches with `Set as main` / `Rename`; collapsible right-hand
+  `.branch-minimap` rail (hidden when `branches.length <= 1`, moves to top bar on `<= 960px`) with an SVG
+  git-graph and quick actions; header `⑂` branch pill; sidebar & grid `⑂N` badge; `<branch-result>` cards.
+- Offline snapshots (`Server.offline_snapshot`) carry deduplicated `branches: {sid: {info, threads, messages}}`
+  for branched sessions, so offline/exported HTML copies support full read-only branch switching and minimap.
+- TUI: `/branch` without arg opens `BranchPicker`; header shows `⑂ <name> (N)` when branched; transcript
+  renders inline `⑂` fork lines, aside origin dividers, and `<branch-result>` boxes.
+
+### Tests
+`test/test_branches.py` (aside CRUD, mid-conversation forks, auto-promotion, metadata-only prompt & tool,
+`ask`, `message` + `<thread-message>`, per-tab views, offline snapshot), `test/test_subagents.py` (fresh &
+forked subagent threads, concurrent spawning, stopping, anti-recursion), `test/test_peers.py` (immediate
+read-only `ask` on idle peers, peer-to-subagent messaging), and `test/test_tui.py` `BranchTests`.
+
+## v17: unified session threads, per-tab views, unified tools, sidebar tree & two-mode minimap
+
+Owner's refinements on v16 (see [questions/035-branching-aside.md](../questions/035-branching-aside.md)):
+
+### Unified thread model (migration 9)
+- `branches` gains `parent_branch_id TEXT`, `spawned_at_id INTEGER`, `context_mode TEXT` (`'fork'` | `'fresh'`).
+- Subagents are now `kind = 'subagent'` threads inside the same session rather than separate child sessions:
+  - `context='fresh'` (default): `origin_id = NULL` (clean isolated LLM history), `spawned_at_id` = assistant
+    message that called `spawn` (visual anchor in UI/minimap, rendered with dashed lines & hollow nodes).
+  - `context='fork'`: `origin_id` = parent message before the `tool_use` turn (so no dangling `tool_use` is
+    inherited), `spawned_at_id` = assistant message (solid Bezier line, shared context).
+- Session summaries carry compact `threads[]` so the left sidebar renders an expandable tree under every
+  multi-thread session without extra RPCs.
+
+### Unified agent tools (`sfh/tools.py`, `sfh/branches.py`)
+- Replaced the 6 overlapping tools (`subagent`, `branches`, `ask_branch`, `message_branch`, `peers`,
+  `send_message`) with 4 unified tools (old names kept as backwards-compatible aliases in `tools.execute`):
+  - `threads`: unified roster of this session's threads (metadata-only for user asides) + repo peers & claims.
+  - `spawn(description, prompt, context='fresh'|'fork')`: spawns a background subagent thread (disallowed
+    inside subagent threads to prevent recursion). Reports back via `<thread-message from=… kind=… status=…>`.
+  - `ask(target_id, question)`: synchronous one-shot read-only `/btw` query against ANY thread — local
+    branch/subagent OR active/idle peer session in the same repo (triggers an immediate response without
+    requiring "Let it answer" and without mutating the peer's transcript).
+  - `message(target_id, text, kind?, reply_to?)`: async delivery to ANY thread (runs a turn on local
+    branches/subagents and delivers `<thread-message>` back; routes peer sessions via `peers.Hub` or wakes a
+    peer's subagent thread directly).
+
+### Per-tab views (`#session/<sid>/<tid>`)
+- Each `/ws` `Client` tracks `branch_of[sid]`. `sessions.subscribe {session_id, branch_id?}`, `chat.send`,
+  `chat.edit`, `chat.stop`, `branches.create`, `branches.list`, and `branches.switch` all scope to that
+  client's viewed thread. `branches.emit_updated` sends each subscribed client a `tree_info` tailored to its
+  own viewed thread; switching threads in one tab never moves another tab.
+
+### Left sidebar tree & two-mode right-hand minimap (`app.js`, `app.css`)
+- **Left sidebar**: expandable tree under each multi-thread session showing Main, Asides (`⑂`), Fresh
+  Subagents (`◌`), Forked Subagents (`⑂ fork`), and Edits (`↺`) linking to `#session/<sid>/<tid>`.
+- **Right-hand minimap (two displays)**:
+  - **Minimal (default)**: Sublime Text–style translucent floating overlay on the right showing a miniature
+    SVG graph (solid curves for forked context, dashed curves for fresh subagents, proportional mini-bars,
+    active glow ring). Clicking anywhere on it expands the full graph sidebar.
+  - **Expanded**: full `260px` right-hand graph sidebar showing the whole tree + thread titles, kind/context
+    tags, `↗` open-in-new-tab links, `★` promote, `✎` rename, `✕` delete, `+ Aside`, and `⇥` minimize back
+    to the translucent minimap.

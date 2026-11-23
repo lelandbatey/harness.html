@@ -989,5 +989,82 @@ class FirstRunTest(unittest.TestCase):
                 proc.kill()
             os.close(master)
 
+
+class BranchTests(unittest.TestCase):
+    def test_branch_result_and_fork_marker(self):
+        br = tui.parse_branch_result('<thread-message from="b_123" title="port check" kind="subagent" status="completed">All good</thread-message>')
+        self.assertEqual(br, {"branch_id": "b_123", "title": "port check", "kind": "subagent", "status": "completed", "body": "All good"})
+        msg_u = {"id": 1, "role": "user", "content": [{"type": "text", "text": "hello"}]}
+        msg_a = {"id": 2, "role": "assistant", "content": [{"type": "text", "text": "world"}]}
+        msg_br = {"id": 3, "role": "user", "content": [{"type": "text", "text": '<thread-message from="b_123" title="port check" kind="subagent" status="completed">All good</thread-message>'}]}
+        self.assertFalse(tui.is_prompt_msg(msg_br))
+        self.assertTrue(tui.starts_turn(msg_br))
+        binfo = {
+            "active_branch_id": "b_main",
+            "main_branch_id": "b_main",
+            "branches": [
+                {"id": "b_main", "name": "Main", "kind": "main", "is_active": True, "is_main": True, "origin_id": None, "own_messages": 2},
+                {"id": "b_123", "name": "port check", "kind": "aside", "is_active": False, "is_main": False, "origin_id": 2, "own_messages": 2},
+            ],
+            "forks": {"2": [{"branch_id": "b_123", "name": "port check", "kind": "aside", "status": "idle", "own_messages": 2, "is_main": False, "nested": 0}]},
+        }
+        lines = tui.render_transcript([("msg", msg_u), ("msg", msg_a), ("msg", msg_br)], None, 80, branches=binfo)
+        plain = "\n".join(tui._SGR_RE.sub("", l) for l in lines)
+        self.assertIn("⑂ 1 branch: port check", plain)
+        self.assertIn("subagent port check [completed]", plain)
+        self.assertIn("All good", plain)
+
+    def test_branch_picker_and_switch_command(self):
+        binfo = {
+            "active_branch_id": "b_main",
+            "main_branch_id": "b_main",
+            "branches": [
+                {"id": "b_main", "name": "Main", "kind": "main", "parent_branch_id": None, "is_active": True, "is_main": True, "own_messages": 4, "status": "idle"},
+                {"id": "b_side", "name": "port hash check", "kind": "aside", "parent_branch_id": "b_main", "is_active": False, "is_main": False, "own_messages": 2, "status": "idle"},
+            ],
+            "forks": {},
+        }
+        p = tui.BranchPicker(binfo)
+        self.assertEqual(p.sel, 0)
+        p.handle("down")
+        self.assertEqual(p.handle("enter"), ("branch", "b_side"))
+        rows = p.render(80, 5)
+        plain = "\n".join(tui._SGR_RE.sub("", r) for r in rows)
+        self.assertIn("port hash check", plain)
+        self.assertIn("↳ port hash check", plain)
+
+        # App /branch opens picker and Enter calls branches.switch
+        calls = []
+
+        class FakeRPC:
+            def call(self, m, params=None):
+                calls.append((m, params))
+                if m == "branches.list":
+                    return binfo
+                if m == "branches.switch":
+                    return {"session": {"id": "s_1", "title": "t", "status": "idle", "branch_count": 2,
+                                        "active_branch_id": "b_side", "active_branch_name": "port hash check"},
+                            "branch_id": "b_side", "branches": binfo,
+                            "messages": [{"id": 1, "role": "user", "content": [{"type": "text", "text": "hi"}]}],
+                            "draft": None, "queue": [], "tools": {}}
+                return {}
+
+        app = tui.App("/tmp/h.html", {})
+        app.rpc = FakeRPC()
+        app.session = {"id": "s_1", "title": "t", "status": "idle", "branch_count": 2,
+                       "active_branch_id": "b_main", "active_branch_name": "Main"}
+        app.branch_id = "b_main"
+        app.branches = binfo
+        app.submit("/branch", None)
+        self.assertIsInstance(app.picker, tui.BranchPicker)
+        app.handle_key("down")
+        app.handle_key("enter")
+        self.assertIsNone(app.picker)
+        self.assertEqual(app.branch_id, "b_side")
+        self.assertIn(("branches.switch", {"session_id": "s_1", "branch_id": "b_side"}), calls)
+        rows, _ = app.frame()
+        self.assertIn("port hash check (2)", tui._SGR_RE.sub("", rows[0]))
+
+
 if __name__ == "__main__":
     unittest.main()

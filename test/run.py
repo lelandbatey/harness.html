@@ -24,7 +24,8 @@ import fastenv  # noqa: E402
 
 # classes whose tests each run in their own process: they are slow one after another (long mock turns,
 # PTYs), and a test class's server starts in ~0.2s
-SPLIT = {"test_subagents.TestSubagents", "test_peers.TestPeers", "test_tui.EndToEndTest", "test_tui.FirstRunTest",
+SPLIT = {"test_subagents.TestSubagents", "test_peers.TestPeers", "test_branches.TestBranches",
+         "test_tui.EndToEndTest", "test_tui.FirstRunTest",
          "test_server.TestUsageAndSubjects", "test_server.TestOnboarding", "test_server.TestChat",
          "test_build.BuildTest", "test_llm.RetryTest"}
 JOB_TIMEOUT = 120

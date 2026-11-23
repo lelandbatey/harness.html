@@ -6,7 +6,7 @@ import os
 import re
 import threading
 
-from . import links, llm, peers, signals, skills, subagents, tools
+from . import branches, links, llm, peers, signals, skills, subagents, tools
 from .store import now_ms
 
 MAX_ITERATIONS = 300   # unattended LLM calls (tool loop iterations) per user message
@@ -129,7 +129,21 @@ SUMMARY_HEADER = ("<conversation-summary>\nThe earlier part of this conversation
 
 
 class Runtime:
-    """In-memory state of one session."""
+    """In-memory session-level state (peer coordination)."""
+
+    def __init__(self):
+        # peer sessions (peers.py), in memory only
+        self.activity = None     # {"tool", "summary", "at"} of the last tool call
+        self.edited = {}         # abs path -> ms of this session's last edit/write
+        self.seen = {}           # abs path -> mtime_ns after this session's last read/edit/write
+        self.inbox = []          # undelivered peer messages
+        self.peer_sig = None     # the peer ids the model was last told about
+        self.wakes = []          # ms of turns started by peer questions
+        self.title_gen = 0       # generation counter for session retitle calls
+
+
+class BranchRuntime:
+    """In-memory execution state of one branch within a session."""
 
     def __init__(self):
         self.task = None
@@ -139,15 +153,11 @@ class Runtime:
         self.cancel = None       # asyncio.Event for the running turn
         self.tool_ctx = None
         self.btw_tasks = set()
-        # peer sessions (peers.py), in memory only
-        self.activity = None     # {"tool", "summary", "at"} of the last tool call
-        self.edited = {}         # abs path -> ms of this session's last edit/write
-        self.seen = {}           # abs path -> mtime_ns after this session's last read/edit/write
-        self.inbox = []          # undelivered peer messages
-        self.peer_sig = None     # the peer ids the model was last told about
-        self.wakes = []          # ms of turns started by peer questions
         self.prompted = False    # the current run had a real prompt (not only a peer wake)
         self.tools = {}          # tool_use id -> {"started_at", "ended_at"?} of the current step's tool runs
+        self.sub_error = None
+        self.title_gen = 0
+        self.notify_branch = None  # branch id waiting for this branch's result (message_branch)
 
 
 class Agent:
@@ -155,8 +165,19 @@ class Agent:
         self.server = server
         self.store = server.store
         self.rt = collections.defaultdict(Runtime)
+        self.brt = collections.defaultdict(BranchRuntime)
         self.bg = set()
         self.peers = peers.Hub(self)
+
+    def branch_rt(self, bid):
+        return self.brt[bid]
+
+    def branch_running(self, bid):
+        brt = self.brt.get(bid)
+        return bool(brt and brt.task and not brt.task.done())
+
+    def active_branch(self, sid):
+        return branches.ensure(self.store, sid)
 
     # --- sessions ------------------------------------------------------------------------------
 
@@ -209,17 +230,27 @@ class Agent:
                                    "FROM sessions WHERE id=?", (sid,))
         if not row:
             return None
-        count = len(self.thread_ids(sid))
-        rt = self.rt.get(sid)
+        active_bid = branches.ensure(self.store, sid)
+        b_rows = self.store.query("SELECT id, name, kind FROM branches WHERE session_id=?", (sid,))
+        any_running = any(self.branch_running(r[0]) for r in b_rows)
+        active_running = self.branch_running(active_bid)
+        active_row = next((r for r in b_rows if r[0] == active_bid), None)
+        count = len(self.thread_ids(sid, active_bid))
         try:
             provider, model = self.session_llm(sid, glob=glob)
             pid, perr = provider["id"], None
         except llm.LLMError as e:
             pid, model, perr = row[7], row[6], str(e)
+        bname = (active_row[1] or ("Main" if active_row[2] == "main" else "New aside")) if active_row else "Main"
+        bkind = (active_row[2] or "main") if active_row else "main"
         out = dict({"id": row[0], "title": row[1] or "", "cwd": row[2], "created_at": row[3], "updated_at": row[4],
                     "subjects": json.loads(row[5] or "[]"), "model": model, "provider": pid,
                     "model_override": row[6], "provider_override": row[7],
-                    "status": "running" if rt and rt.task and not rt.task.done() else "idle",
+                    "status": "running" if any_running else "idle",
+                    "active_status": "running" if active_running else "idle",
+                    "active_branch_id": active_bid, "active_branch_name": bname, "active_branch_kind": bkind,
+                    "branch_count": len(b_rows),
+                    "threads": branches.compact_threads(self, sid),
                     "message_count": count}, **subagents.info(self.store, sid))
         out.update(self.peers.summary_fields(sid, row[2]))
         if perr:
@@ -320,6 +351,7 @@ class Agent:
         t = now_ms()
         self.store.execute("INSERT INTO sessions(id, title, cwd, created_at, updated_at, subjects, model) "
                            "VALUES(?, '', ?, ?, ?, '[]', NULL)", (sid, cwd, t, t))
+        branches.ensure(self.store, sid)
         if remember:
             self.store.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('last_new_session_cwd', ?)", (cwd,))
             self.use_cwd(cwd)
@@ -386,23 +418,29 @@ class Agent:
 
     async def delete(self, sid):
         self.require(sid)
-        await self.stop(sid)
+        bids = [r[0] for r in self.store.query("SELECT id FROM branches WHERE session_id=?", (sid,))]
+        await self.stop_all(sid)
         with self.store.lock:
+            self.store.execute("DELETE FROM branches WHERE session_id=?", (sid,))
             self.store.execute("DELETE FROM messages WHERE session_id=?", (sid,))
             self.store.execute("DELETE FROM sessions WHERE id=?", (sid,))
+        for bid in bids:
+            self.brt.pop(bid, None)
         self.rt.pop(sid, None)
         self.peers.forget(sid)
         self.server.broadcast("session.deleted", {"session_id": sid})
 
-    def head(self, sid):
+    def head(self, sid, branch_id=None):
+        if branch_id is not None:
+            return branches.head_of(self.store, sid, branch_id)
         row = self.store.query_one("SELECT head_id FROM sessions WHERE id=?", (sid,))
         return row[0] if row else None
 
-    def thread_ids(self, sid):
-        """Ids of the displayed branch, oldest first (walk from head_id via parent_id)."""
+    def thread_ids(self, sid, branch_id=None):
+        """Ids of the displayed (or given) branch, oldest first (walk from head_id via parent_id)."""
         with self.store.lock:
             parents = dict(self.store.query("SELECT id, parent_id FROM messages WHERE session_id=?", (sid,)))
-            cur = self.head(sid)
+            cur = self.head(sid, branch_id)
         out = []
         while cur is not None and cur in parents and len(out) <= len(parents):
             out.append(cur)
@@ -416,9 +454,9 @@ class Agent:
                                 (sid, parent_id))
         return sum(1 for r in rows if is_prompt(json.loads(r[0])))
 
-    def messages(self, sid):
-        """The displayed branch of the session."""
-        ids = self.thread_ids(sid)
+    def messages(self, sid, branch_id=None):
+        """The displayed (or given) branch of the session."""
+        ids = self.thread_ids(sid, branch_id)
         if not ids:
             return []
         rows = {r[0]: r for r in self.store.query(
@@ -427,10 +465,11 @@ class Agent:
             (r[5]) for r in rows.values() if r[2] == "user" and is_prompt(json.loads(r[3])))
         return [message_dict(rows[i], counts.get(rows[i][5])) for i in ids]
 
-    def add_message(self, sid, role, content, model=None, provider=None, usage=None, effort=None, started_at=None):
-        """Stores a message on the displayed branch, recording the model/provider it was made with (default:
-        what the session uses now), the session's cwd and the local file links in it that exist now. effort:
-        the effort level its request was sent with; started_at: when that request started (ms)."""
+    def add_message(self, sid, role, content, model=None, provider=None, usage=None, effort=None, started_at=None,
+                    branch_id=None):
+        """Stores a message on the displayed (or given) branch, recording the model/provider it was made with
+        (default: what the session uses now), the session's cwd and the local file links in it that exist now.
+        effort: the effort level its request was sent with; started_at: when that request started (ms)."""
         t = now_ms()
         if model is None and provider is None:
             try:
@@ -441,16 +480,16 @@ class Agent:
         cwd = self.store.query_one("SELECT cwd FROM sessions WHERE id=?", (sid,))[0]
         found = links.for_content(content, cwd)
         with self.store.lock:
-            parent = self.head(sid)
+            bid = branch_id or branches.ensure(self.store, sid)
+            parent = branches.head_of(self.store, sid, bid)
             mid = self.store.execute(
                 "INSERT INTO messages(session_id, role, content, created_at, parent_id, model, provider, cwd, links, "
                 "usage, effort, started_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (sid, role, json.dumps(content), t, parent, model, provider, cwd, json.dumps(found),
                  json.dumps(usage) if usage else None, effort, started_at))
-            self.store.execute("UPDATE sessions SET head_id=? WHERE id=?", (mid, sid))
-            self.touch(sid)
-        msg = {"id": mid, "session_id": sid, "role": role, "content": content, "created_at": t, "parent_id": parent,
-               "model": model, "provider": provider, "cwd": cwd, "links": found}
+            branches.set_head(self.store, sid, bid, mid)
+        msg = {"id": mid, "session_id": sid, "branch_id": bid, "role": role, "content": content, "created_at": t,
+               "parent_id": parent, "model": model, "provider": provider, "cwd": cwd, "links": found}
         if usage:
             msg["usage"] = usage
         if effort:
@@ -462,9 +501,9 @@ class Agent:
         self.server.emit(sid, "message.added", msg)
         return msg
 
-    def llm_history(self, sid, msgs=None):
-        """What the model sees: the displayed branch from the last compaction on, the summary first."""
-        msgs = self.messages(sid) if msgs is None else msgs
+    def llm_history(self, sid, msgs=None, branch_id=None):
+        """What the model sees: the branch from the last compaction on, the summary first."""
+        msgs = self.messages(sid, branch_id) if msgs is None else msgs
         cut = max((i for i, m in enumerate(msgs) if m["role"] == "user" and is_compaction(m["content"])), default=None)
         if cut is None:
             return msgs
@@ -472,12 +511,12 @@ class Agent:
         head = dict(msgs[cut], content=[{"type": "text", "text": SUMMARY_HEADER % summary}])
         return [head] + msgs[cut + 1:]
 
-    def context_info(self, sid, provider_id, model, msgs=None):
+    def context_info(self, sid, provider_id, model, msgs=None, branch_id=None):
         """{"used", "window", "estimated"}: tokens the conversation occupies in the model's context now
         (the last response's input + output since the last compaction; estimated from text length right
         after a compaction or when no response reported usage) and the model's context window size (the user's `model_overrides` setting, else the provider's model
         list; "window_override": true when it comes from the setting)."""
-        msgs = self.messages(sid) if msgs is None else msgs
+        msgs = self.messages(sid, branch_id) if msgs is None else msgs
         used, estimated = None, False
         for m in reversed(msgs):
             if m["role"] == "user" and is_compaction(m["content"]):
@@ -505,38 +544,48 @@ class Agent:
             out["window_override"] = True
         return out
 
-    def snapshot(self, sid):
+    def snapshot(self, sid, branch_id=None):
         s = self.require(sid)
-        rt = self.rt.get(sid)
-        return {"session": s, "messages": self.messages(sid),
-                "draft": rt.draft if rt else None, "queue": list(rt.queue) if rt else [],
-                "tools": dict(rt.tools) if rt else {}, "now": now_ms()}
+        bid = branch_id or self.active_branch(sid)
+        brt = self.brt.get(bid)
+        return {"session": s, "branch_id": bid, "branches": branches.tree_info(self, sid, active_bid=bid),
+                "messages": self.messages(sid, bid),
+                "draft": brt.draft if brt else None, "queue": list(brt.queue) if brt else [],
+                "tools": dict(brt.tools) if brt else {}, "now": now_ms()}
 
-    def system_prompt(self, sid):
+    def system_prompt(self, sid, branch_id=None):
         s = self.require(sid)
-        return skills.system_prompt(self.settings(), s["cwd"], self.server.html_path)
+        return skills.system_prompt(self.settings(), s["cwd"], self.server.html_path) + branches.system_note(
+            self, sid, branch_id)
 
     # --- chat ----------------------------------------------------------------------------------
 
-    def running(self, sid):
-        rt = self.rt.get(sid)
-        return bool(rt and rt.task and not rt.task.done())
+    def running(self, sid, branch_id=None):
+        if branch_id is not None:
+            return self.branch_running(branch_id)
+        rows = self.store.query("SELECT id FROM branches WHERE session_id=?", (sid,))
+        return any(self.branch_running(r[0]) for r in rows)
 
-    async def send(self, sid, text):
+    async def send(self, sid, text, branch_id=None, from_branch=False):
         self.require(sid)
-        rt = self.rt[sid]
-        if self.running(sid):
-            rt.queue.append(text)
-            self.server.emit(sid, "queue.updated", {"session_id": sid, "queue": list(rt.queue)})
+        bid = branch_id or self.active_branch(sid)
+        brt = self.brt[bid]
+        if self.branch_running(bid):
+            brt.queue.append((text, from_branch) if from_branch else text)
+            self.server.emit(sid, "queue.updated", {"session_id": sid, "branch_id": bid,
+                                                    "queue": [q[0] if isinstance(q, tuple) else q for q in brt.queue]})
             return True
-        rt.task = asyncio.ensure_future(self._run(sid, text))
+        brt.task = asyncio.ensure_future(self._run(sid, text, bid, from_branch=from_branch))
         return False
 
     def wake(self, sid):
         """Starts a turn without a prompt, to handle the session's inbox (peer questions)."""
-        if self.running(sid) or not self.summary(sid):
+        if not self.summary(sid):
             return False
-        self.rt[sid].task = asyncio.ensure_future(self._run(sid, None))
+        bid = self.active_branch(sid)
+        if self.branch_running(bid):
+            return False
+        self.brt[bid].task = asyncio.ensure_future(self._run(sid, None, bid))
         return True
 
     def deliver_inbox(self, sid):
@@ -545,79 +594,96 @@ class Agent:
         rt = self.rt[sid]
         if not rt.inbox:
             return False
-        if self.running(sid):
+        bid = self.active_branch(sid)
+        if self.branch_running(bid):
             return True  # delivered at its next step anyway
         return self.wake(sid)
 
-    def store_peer_blocks(self, sid):
+    def store_peer_blocks(self, sid, branch_id=None):
         """Stores the pending peer blocks (peer-sessions note + inbox) as a user message; True if any."""
         blocks = self.peers.pending_blocks(sid)
         if not blocks:
             return False
-        self.add_message(sid, "user", blocks)
+        self.add_message(sid, "user", blocks, branch_id=branch_id)
         self.updated(sid)
         return True
 
-    async def stop(self, sid):
-        rt = self.rt.get(sid)
-        if not rt:
+    async def stop_branch(self, sid, bid):
+        brt = self.brt.get(bid)
+        if not brt:
             return
-        if rt.queue:
-            rt.queue.clear()
-            self.server.emit(sid, "queue.updated", {"session_id": sid, "queue": []})
-        if rt.cancel:
-            rt.cancel.set()
-        if rt.stream:
-            stream = rt.stream
+        if brt.queue:
+            brt.queue.clear()
+            self.server.emit(sid, "queue.updated", {"session_id": sid, "branch_id": bid, "queue": []})
+        if brt.cancel:
+            brt.cancel.set()
+        if brt.stream:
+            stream = brt.stream
             in_thread(stream.close)
-        if rt.tool_ctx:
-            rt.tool_ctx.cancel()
-        if rt.task and not rt.task.done():
+        if brt.tool_ctx:
+            brt.tool_ctx.cancel()
+        if brt.task and not brt.task.done():
             try:
-                await asyncio.wait_for(asyncio.shield(rt.task), 10)
+                await asyncio.wait_for(asyncio.shield(brt.task), 10)
             except Exception:
                 pass
 
-    async def edit(self, sid, message_id, text):
+    async def stop(self, sid):
+        bid = self.active_branch(sid)
+        if bid:
+            await self.stop_branch(sid, bid)
+
+    async def stop_all(self, sid):
+        bids = [r[0] for r in self.store.query("SELECT id FROM branches WHERE session_id=?", (sid,))]
+        for bid in bids:
+            await self.stop_branch(sid, bid)
+
+    async def edit(self, sid, message_id, text, branch_id=None):
         self.require(sid)
-        await self.stop(sid)
+        bid = branch_id or self.active_branch(sid)
+        await self.stop_branch(sid, bid)
         row = self.store.query_one("SELECT role, parent_id, content FROM messages WHERE id=? AND session_id=?",
                                    (message_id, sid))
         if not row or row[0] != "user" or not is_prompt(json.loads(row[2])):
             raise ValueError("no such user message")
-        if message_id not in self.thread_ids(sid):
+        if message_id not in self.thread_ids(sid, bid):
             raise ValueError("message is not on the displayed branch")
-        # the old branch stays in the db; the new prompt becomes a sibling of the edited one
-        self.store.execute("UPDATE sessions SET head_id=? WHERE id=?", (row[1], sid))
+        old_head = branches.head_of(self.store, sid, bid)
+        old_text = "\n".join(b.get("text", "") for b in json.loads(row[2]) if b.get("type") == "text")
+        branches.record_edit_branch(self.store, sid, bid, message_id, old_head, old_text)
+        # the old branch stays in the db (and in `branches` as kind='edit'); the new prompt is a sibling
+        branches.set_head(self.store, sid, bid, row[1])
         self.server.emit(sid, "messages.truncated", {"session_id": sid, "from_id": message_id})
-        await self.send(sid, text)
+        branches.emit_updated(self, sid)
+        await self.send(sid, text, branch_id=bid)
 
     # --- /compact ------------------------------------------------------------------------------
 
-    async def compact(self, sid, instructions=""):
+    async def compact(self, sid, instructions="", branch_id=None):
         """Summarizes the conversation with the session's model; the summary replaces the earlier messages
-        for the model from then on (they stay displayed). Runs as the session's task, so the session shows
+        for the model from then on (they stay displayed). Runs as the branch's task, so the session shows
         as running, messages sent meanwhile queue, and chat.stop cancels it."""
         self.require(sid)
-        if self.running(sid):
+        bid = branch_id or self.active_branch(sid)
+        if self.branch_running(bid):
             raise ValueError("the session is busy: wait for the turn to finish (or stop it), then /compact")
-        if not any(m["role"] == "assistant" for m in self.llm_history(sid)[1:]):
+        if not any(m["role"] == "assistant" for m in self.llm_history(sid, branch_id=bid)[1:]):
             raise ValueError("nothing to compact yet")
-        rt = self.rt[sid]
-        rt.task = asyncio.ensure_future(self._compact(sid, rt, instructions))
+        brt = self.brt[bid]
+        brt.task = asyncio.ensure_future(self._compact(sid, bid, brt, instructions))
         self.updated(sid)
 
-    async def _compact(self, sid, rt, instructions):
+    async def _compact(self, sid, bid, rt, instructions):
         rt.cancel = asyncio.Event()
         loop = asyncio.get_running_loop()
-        notice = lambda text, level="info": self.server.emit(sid, "notice", {"session_id": sid, "level": level,
-                                                                             "text": text})
+        notice = lambda text, level="info": self.server.emit(sid, "notice", {"session_id": sid, "branch_id": bid,
+                                                                             "level": level, "text": text})
         notice("Compacting the conversation…")
         try:
             settings = self.settings()
             session = self.require(sid)
             provider, model = self.session_llm(sid, settings)
-            history = self.llm_history(sid)
+            history = self.llm_history(sid, branch_id=bid)
             prompt = COMPACT_PROMPT + ("\n\nAdditional instructions from the user: " + instructions
                                        if instructions else "")
             system = skills.system_prompt(settings, session["cwd"], self.server.html_path)
@@ -626,8 +692,8 @@ class Agent:
                                          history + [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
                                          None, settings["max_tokens"], 0)
             asyncio.ensure_future(self.server.pricing(provider))  # in parallel with the response
-            content, _, error, usage = await self._stream(sid, rt, stream, loop)
-            self.server.emit(sid, "draft.end", {"session_id": sid, "turn_id": rt.draft["turn_id"]})
+            content, _, error, usage = await self._stream(sid, bid, rt, stream, loop)
+            self.server.emit(sid, "draft.end", {"session_id": sid, "branch_id": bid, "turn_id": rt.draft["turn_id"]})
             rt.draft = None
             if usage:
                 self.add_usage(sid, await self.price(provider, model, usage))
@@ -639,7 +705,7 @@ class Agent:
             if not text:
                 raise llm.LLMError("the model returned an empty summary")
             self.add_message(sid, "user", [{"type": "text", "text": text, "compaction": True,
-                                            "compacted": len(history)}], model, provider["id"])
+                                            "compacted": len(history)}], model, provider["id"], branch_id=bid)
             notice("Compacted %d messages into a summary of about %s tokens. The model now sees the summary and "
                    "what follows; the messages above stay here for you." % (len(history), "{:,}".format(len(text) // 4)))
         except Exception as e:
@@ -651,50 +717,76 @@ class Agent:
             if rt.task is asyncio.current_task():
                 rt.task = None
             if rt.queue and self.summary(sid):  # messages sent while compacting
-                text = rt.queue.pop(0)
-                self.server.emit(sid, "queue.updated", {"session_id": sid, "queue": list(rt.queue)})
-                rt.task = asyncio.ensure_future(self._run(sid, text))
+                nxt = rt.queue.pop(0)
+                q_text, q_fb = nxt if isinstance(nxt, tuple) else (nxt, False)
+                self.server.emit(sid, "queue.updated", {"session_id": sid, "branch_id": bid,
+                                                        "queue": [q[0] if isinstance(q, tuple) else q for q in rt.queue]})
+                rt.task = asyncio.ensure_future(self._run(sid, q_text, bid, from_branch=q_fb))
             elif self.summary(sid) and self.peers.wants_turn(sid):
-                rt.task = asyncio.ensure_future(self._run(sid, None))
+                rt.task = asyncio.ensure_future(self._run(sid, None, bid))
             self.updated(sid)
 
-    async def _run(self, sid, text):
+    async def _run(self, sid, text, branch_id=None, from_branch=False):
         """text None: a wake by a peer question (only the inbox is delivered)."""
-        rt = self.rt[sid]
+        bid = branch_id or self.active_branch(sid)
+        rt = self.brt[bid]
         rt.prompted = False
         first_exchange = False
+        first_aside_exchange = False
         try:
             while True:
-                first = not any(m["role"] == "user" for m in self.messages(sid))
-                had_peer = self.store_peer_blocks(sid)
+                msgs_before = self.messages(sid, bid)
+                first = not any(m["role"] == "user" for m in msgs_before)
+                brow = branches.get_row(self.store, sid, bid)
+                aside_first = False
+                if brow and brow[5] == "aside" and text is not None and not from_branch:
+                    origin_id = brow[3]
+                    own_before = msgs_before[next((i + 1 for i, m in enumerate(msgs_before) if m["id"] == origin_id), 0):] if origin_id else msgs_before
+                    aside_first = not any(m["role"] == "user" and is_prompt(m["content"]) for m in own_before)
+                had_peer = self.store_peer_blocks(sid, branch_id=bid)
                 if text is None:
                     if not had_peer:
                         break
                     first = False
                 else:
                     rt.prompted = True
-                    self.add_message(sid, "user", [{"type": "text", "text": text}])
+                    self.add_message(sid, "user", [{"type": "text", "text": text}], branch_id=bid)
+                    if aside_first:
+                        first_aside_exchange = True
+                        if not brow[2]:
+                            fb = branches.fallback_branch_name(text)
+                            if fb:
+                                self.store.execute("UPDATE branches SET name=? WHERE id=?", (fb, bid))
+                        self.spawn(branches.retitle(self, sid, bid))
+                    if not from_branch:
+                        branches.maybe_auto_promote(self, sid, bid)
                 self.updated(sid)
+                if (self.summary(sid) or {}).get("branch_count", 1) > 1:
+                    branches.emit_updated(self, sid)
                 if first:
                     # title + identicon subjects from the first message now, and again (below) once the
                     # first exchange is done and control is back with the user
                     first_exchange = True
                     self.spawn(self.retitle(sid))
                 try:
-                    await self._turn(sid, rt)
+                    await self._turn(sid, bid, rt)
                 except Exception as e:
                     rt.sub_error = e
-                    self.server.emit(sid, "notice", {"session_id": sid, "level": "error", "text": "**Error:** %s" % e})
+                    self.server.emit(sid, "notice", {"session_id": sid, "branch_id": bid, "level": "error",
+                                                     "text": "**Error:** %s" % e})
                 if rt.cancel and rt.cancel.is_set():
                     break
                 if rt.queue:
-                    text = rt.queue.pop(0)
-                    self.server.emit(sid, "queue.updated", {"session_id": sid, "queue": list(rt.queue)})
+                    nxt = rt.queue.pop(0)
+                    text, from_branch = nxt if isinstance(nxt, tuple) else (nxt, False)
+                    self.server.emit(sid, "queue.updated", {"session_id": sid, "branch_id": bid,
+                                                            "queue": [q[0] if isinstance(q, tuple) else q for q in rt.queue]})
                 elif self.peers.wants_turn(sid):  # a question arrived during the last step
-                    text = None
+                    text, from_branch = None, False
                 else:
                     break
         finally:
+            branches.turn_finished(self, sid, bid, rt, getattr(rt, "sub_error", None))
             if rt.prompted:  # a turn only answering peers doesn't report back to the parent
                 subagents.turn_finished(self, sid, rt, getattr(rt, "sub_error", None))
             rt.sub_error = None
@@ -706,11 +798,15 @@ class Agent:
             loop_task = asyncio.current_task()
             if rt.task is loop_task:
                 rt.task = None
-            self.updated(sid)
-            if first_exchange and self.summary(sid):
+            s = self.updated(sid)
+            if s and s.get("branch_count", 1) > 1:
+                branches.emit_updated(self, sid)
+            if first_exchange and s:
                 self.spawn(self.retitle(sid))
+            if first_aside_exchange and s:
+                self.spawn(branches.retitle(self, sid, bid))
 
-    async def _turn(self, sid, rt):
+    async def _turn(self, sid, bid, rt):
         rt.cancel = asyncio.Event()
         loop = asyncio.get_running_loop()
         for _ in range(MAX_ITERATIONS):
@@ -720,22 +816,24 @@ class Agent:
             _, effort, einfo = self.session_effort(sid, provider["id"], model, settings)
             system = skills.system_prompt(settings, session["cwd"], self.server.html_path)
             system += subagents.system_note(self.store, sid)
+            system += branches.system_note(self, sid, bid)
             started = now_ms()
-            stream = llm.retrying_stream(settings, provider, self.server.creds, model, system, self.llm_history(sid),
-                                         subagents.tool_defs(self.store, sid), settings["max_tokens"],
+            stream = llm.retrying_stream(settings, provider, self.server.creds, model, system,
+                                         self.llm_history(sid, branch_id=bid),
+                                         branches.tool_defs(self.store, sid, bid), settings["max_tokens"],
                                          settings["thinking_budget"], effort, einfo["adaptive"])
             asyncio.ensure_future(self.server.pricing(provider))  # in parallel with the response
-            content, stop_reason, error, usage = await self._stream(sid, rt, stream, loop)
+            content, stop_reason, error, usage = await self._stream(sid, bid, rt, stream, loop)
             cancelled = rt.cancel.is_set()
             if (error and not cancelled and not content and effort and einfo["source"] != "override"
                     and llm.effort_rejected(error)):
                 # the model doesn't take effort levels: remember that (until a restart; a `model_overrides`
                 # entry makes it permanent) and repeat the request without one
                 self.server.effort_refused.add((provider["id"], model))
-                self.server.emit(sid, "draft.end", {"session_id": sid, "turn_id": rt.draft["turn_id"]})
+                self.server.emit(sid, "draft.end", {"session_id": sid, "branch_id": bid, "turn_id": rt.draft["turn_id"]})
                 rt.draft = None
                 self.server.emit(sid, "notice", {
-                    "session_id": sid, "level": "info",
+                    "session_id": sid, "branch_id": bid, "level": "info",
                     "text": "%s refused the effort level `%s` (%s); sending without one." % (model, effort, error)})
                 self.updated(sid)
                 continue
@@ -743,19 +841,20 @@ class Agent:
             if usage:
                 self.add_usage(sid, await self.price(provider, model, usage))
             if content:
-                self.add_message(sid, "assistant", content, model, provider["id"], usage, effort, started)
-            self.server.emit(sid, "draft.end", {"session_id": sid, "turn_id": rt.draft["turn_id"]})
+                self.add_message(sid, "assistant", content, model, provider["id"], usage, effort, started, branch_id=bid)
+            self.server.emit(sid, "draft.end", {"session_id": sid, "branch_id": bid, "turn_id": rt.draft["turn_id"]})
             rt.draft = None
             if error and not cancelled:
                 raise error
             if cancelled or stop_reason != "tool_use" or not tool_uses:
                 if tool_uses:
-                    self._interrupted_results(sid, tool_uses)
+                    self._interrupted_results(sid, tool_uses, branch_id=bid)
                 return
             rt.tool_ctx = tools.Context(session["cwd"], lambda n, c=session["cwd"]: skills.load(
                 n, c, self.settings(), self.server.html_path))
             subagents.attach(self, sid, rt.tool_ctx, loop)
             rt.tool_ctx.peer = peers.ToolBridge(self.peers, sid, loop)
+            rt.tool_ctx.branch = branches.ToolBridge(self, sid, bid, loop)
             results = []
             rt.tools = {}
             for tu in tool_uses:
@@ -771,7 +870,8 @@ class Agent:
                 self.peers.after_tool(sid, tu["name"], inp, True)  # activity: what it is doing now
                 self.updated(sid)
                 rt.tools[tu["id"]] = {"started_at": t0}
-                self.server.emit(sid, "tool.start", {"session_id": sid, "tool_use_id": tu["id"], "started_at": t0})
+                self.server.emit(sid, "tool.start", {"session_id": sid, "branch_id": bid, "tool_use_id": tu["id"],
+                                                     "started_at": t0})
                 fut = in_thread(tools.execute, tu["name"], inp, rt.tool_ctx)
                 cancel_wait = asyncio.ensure_future(rt.cancel.wait())
                 await asyncio.wait([fut, cancel_wait], return_when=asyncio.FIRST_COMPLETED)
@@ -783,8 +883,8 @@ class Agent:
                     out, is_err = "interrupted", True
                 t1 = now_ms()
                 rt.tools[tu["id"]]["ended_at"] = t1
-                self.server.emit(sid, "tool.end", {"session_id": sid, "tool_use_id": tu["id"], "started_at": t0,
-                                                   "ended_at": t1, "is_error": is_err})
+                self.server.emit(sid, "tool.end", {"session_id": sid, "branch_id": bid, "tool_use_id": tu["id"],
+                                                   "started_at": t0, "ended_at": t1, "is_error": is_err})
                 results.append({"type": "tool_result", "tool_use_id": tu["id"], "content": out, "is_error": is_err,
                                 "started_at": t0, "ended_at": t1})
             rt.tool_ctx = None
@@ -792,25 +892,25 @@ class Agent:
             done = {r["tool_use_id"] for r in results}
             results += [{"type": "tool_result", "tool_use_id": tu["id"], "content": "interrupted", "is_error": True}
                         for tu in tool_uses if tu["id"] not in done]
-            self.add_message(sid, "user", results, model, provider["id"])
+            self.add_message(sid, "user", results, model, provider["id"], branch_id=bid)
             if rt.cancel.is_set():
                 return
-            self.store_peer_blocks(sid)  # peer messages / changed peers reach the model at each step
-        self.server.emit(sid, "notice", {"session_id": sid, "level": "error",
+            self.store_peer_blocks(sid, branch_id=bid)  # peer messages / changed peers reach the model at each step
+        self.server.emit(sid, "notice", {"session_id": sid, "branch_id": bid, "level": "error",
                                          "text": "Stopped after %d tool iterations." % MAX_ITERATIONS})
 
-    def _interrupted_results(self, sid, tool_uses):
+    def _interrupted_results(self, sid, tool_uses, branch_id=None):
         self.add_message(sid, "user", [{"type": "tool_result", "tool_use_id": tu["id"], "content": "interrupted",
-                                        "is_error": True} for tu in tool_uses])
+                                        "is_error": True} for tu in tool_uses], branch_id=branch_id)
 
-    async def _stream(self, sid, rt, stream, loop):
+    async def _stream(self, sid, bid, rt, stream, loop):
         """Consumes a provider stream in a thread, mirroring it into rt.draft + draft.* events.
         Returns (content blocks, stop_reason, error, usage)."""
         turn_id = "t_" + os.urandom(4).hex()
         rt.draft = {"turn_id": turn_id, "content": []}
         rt.stream = stream
         q = asyncio.Queue()
-        self.server.emit(sid, "draft.start", {"session_id": sid, "turn_id": turn_id})
+        self.server.emit(sid, "draft.start", {"session_id": sid, "branch_id": bid, "turn_id": turn_id})
 
         def pump():
             try:
@@ -842,16 +942,16 @@ class Agent:
                         block["partial_json"] = ""
                     block["started_at"] = block["ended_at"] = now_ms()
                     blocks[idx] = block
-                    self.server.emit(sid, "draft.block", {"session_id": sid, "turn_id": turn_id, "index": idx,
-                                                          "block": block})
+                    self.server.emit(sid, "draft.block", {"session_id": sid, "branch_id": bid, "turn_id": turn_id,
+                                                          "index": idx, "block": block})
                 elif kind == "delta":
                     _, idx, field, text = ev
                     b = blocks[idx]
                     b[field] = (b.get(field) or "") + text
                     b["ended_at"] = now_ms()  # streaming time: from the block's start to its last delta
                     if field != "signature":
-                        self.server.emit(sid, "draft.delta", {"session_id": sid, "turn_id": turn_id, "index": idx,
-                                                              field: text})
+                        self.server.emit(sid, "draft.delta", {"session_id": sid, "branch_id": bid, "turn_id": turn_id,
+                                                              "index": idx, field: text})
                 elif kind == "stop":
                     stop_reason = ev[1]
                 elif kind == "usage":
@@ -860,13 +960,13 @@ class Agent:
                     # the attempt failed; its partial output is dropped and the message streams again
                     _, attempt, retries, delay, err = ev
                     self.server.emit(sid, "notice", {
-                        "session_id": sid, "level": "info", "retry": True,
+                        "session_id": sid, "branch_id": bid, "level": "info", "retry": True,
                         "text": "Provider problem: %s — retrying in %.1fs (%d/%d)." % (err, delay, attempt, retries)})
-                    self.server.emit(sid, "draft.end", {"session_id": sid, "turn_id": turn_id})
+                    self.server.emit(sid, "draft.end", {"session_id": sid, "branch_id": bid, "turn_id": turn_id})
                     turn_id = "t_" + os.urandom(4).hex()
                     blocks = []
                     rt.draft = {"turn_id": turn_id, "content": blocks}
-                    self.server.emit(sid, "draft.start", {"session_id": sid, "turn_id": turn_id})
+                    self.server.emit(sid, "draft.start", {"session_id": sid, "branch_id": bid, "turn_id": turn_id})
                 elif kind == "done":
                     break
                 elif kind == "error":
@@ -980,16 +1080,17 @@ class Agent:
 
     # --- /btw ----------------------------------------------------------------------------------
 
-    async def btw(self, sid, question):
+    async def btw(self, sid, question, branch_id=None):
         session = self.require(sid)
+        bid = branch_id or self.active_branch(sid)
         btw_id = "b_" + os.urandom(4).hex()
         settings = self.settings()
         provider, model = self.session_llm(sid, settings)
-        history = self.llm_history(sid) + [{"role": "user", "content": [{"type": "text", "text": question}]}]
+        history = self.llm_history(sid, branch_id=bid) + [{"role": "user", "content": [{"type": "text", "text": question}]}]
         system = (skills.system_prompt(settings, session["cwd"], self.server.html_path) +
                   "\n\n# Side question\nThe user asks a quick side question about this conversation. Answer it "
                   "directly and briefly from the context; you cannot use tools for this answer.")
-        self.server.emit(sid, "btw.start", {"session_id": sid, "btw_id": btw_id, "question": question})
+        self.server.emit(sid, "btw.start", {"session_id": sid, "branch_id": bid, "btw_id": btw_id, "question": question})
         loop = asyncio.get_running_loop()
         q = asyncio.Queue()
 
@@ -1004,15 +1105,15 @@ class Agent:
                 loop.call_soon_threadsafe(q.put_nowait, ("error", e))
 
         in_thread(pump)
-        end = {"session_id": sid, "btw_id": btw_id}
+        end = {"session_id": sid, "branch_id": bid, "btw_id": btw_id}
         while True:
             ev = await q.get()
             if ev[0] == "delta" and ev[2] == "text":
-                self.server.emit(sid, "btw.delta", {"session_id": sid, "btw_id": btw_id, "text": ev[3]})
+                self.server.emit(sid, "btw.delta", {"session_id": sid, "branch_id": bid, "btw_id": btw_id, "text": ev[3]})
             elif ev[0] == "usage":
                 self.add_usage(sid, await self.price(provider, model, ev[1]))
             elif ev[0] == "retry":  # clients drop the partial answer
-                self.server.emit(sid, "btw.delta", {"session_id": sid, "btw_id": btw_id, "reset": True, "text": ""})
+                self.server.emit(sid, "btw.delta", {"session_id": sid, "branch_id": bid, "btw_id": btw_id, "reset": True, "text": ""})
             elif ev[0] == "done":
                 break
             elif ev[0] == "error":

@@ -125,9 +125,18 @@ This harness runs in server mode with an HTTP/websocket API, and has two clients
     completion API
 - Size of the context window is shown all UIs
 - Thinking/reasoning tokens are shown in the UI as a shortened "thinking" line, which can be
-  expanded to show the full thinking/reasoning
+  expanded to show the full thinking/reasoning. By default, "thinking" lines are minimized so as not
+  to dominate the entire screen with scrolling text.
+- The user can "branch" conversations in a more "lightweight" way than forking an entire
+  conversation as a copy. Instead the user can start an `/aside` to start a new branch from the
+  current message, then switch between branches of the conversation. How that looks is UI defined
+  - An aside can turn into the new "main session" if the user just keeps chatting there
+  - Agents can see the side-branches of their session, and can even talk to those branches like
+    subagents, or ask them one-shot questions like `/btw`
+  - Agents are encouraged not to read the whole branches off to the side, only look at metadata and
+    to ask the user if they should check in, or if the user proactively tells them to look.
 - Durations for messages in a session indicate how long they took to run; how long thinking tokens
-  were streaming in, or how long a tool took to run
+  were streaming in, or how long a tool took to run, as we
 - The user can change which effort level, model and provider they are using, even mid-conversation, so each
   message also needs to have what model it was recorded with. When changing the model, there should
   be a way to choose/filter their choices from the list of models available
@@ -141,7 +150,7 @@ This harness runs in server mode with an HTTP/websocket API, and has two clients
   - some kind of tool for launching subagents, subagents that when complete will signal back to the
     parent, but otherwise the subagents run concurrently in the background
   - webfetch
-- Tool iterations are limited to 300 unattended turns
+- Tool iterations are limited to 300 unattended steps
 - Error handling is nice:
   - If a provider isn't responding after a while (~30 second timeout) then the harness retries up to
     3 times (configurable) with some jitter on the retry rate.
@@ -153,8 +162,8 @@ This harness runs in server mode with an HTTP/websocket API, and has two clients
 
 ## HTML client features
 
-- A single-session chat interface, w/ similar experience to the TUI, but with more "standard"
-  keyboard shortcuts instead of emacs-style shortcuts. Text input is more like a textinput
+- A chat interface, w/ similar experience to the TUI, but with more "standard" keyboard shortcuts
+  instead of emacs-style shortcuts. Text input is more like a textinput
 - A view where you can see all sessions and jump into any of them
 - Streaming markdown support when showing responses, with full GFM markdown support
   - Agents should be able to embed HTML into the markdown as well, in order to show diagrams etc.
@@ -193,6 +202,10 @@ This harness runs in server mode with an HTTP/websocket API, and has two clients
     working directories in order of most recently used first.
   - Any time a current directory is chosen, the user should get a little file explorer in the
     browser to choose a folder in.
+- The "branching" nature of sessions is represented in a lightweight way within the UI for a
+  session. You can see that a branch started on a message, and you can see how many, and their
+  titles. Clicking a branch goes "sideways" to that branch. The UI for a session with branches
+  should show a kind of "branch minimap" so the user knows where they are.
 
 
 ## Minimal TUI features

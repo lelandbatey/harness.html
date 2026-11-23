@@ -189,6 +189,8 @@ await waitFor(p1, () => [...document.querySelectorAll(".msgs .msg.assistant .md 
 await waitFor(p1, () => [...document.querySelectorAll(".msgs .thinking")].some((e) => e.textContent.includes("Considering")), "thinking block");
 const thinkingFont = await p1.$eval(".msgs .thinking-body", (e) => getComputedStyle(e).fontStyle);
 if (thinkingFont !== "italic") await fail("thinking block not in a distinct style: " + thinkingFont);
+// thinking stays collapsed while the model reasons: only its summary (label + preview) shows
+if (await p1.evaluate(() => [...document.querySelectorAll(".msgs .thinking")].some((e) => e.open))) await fail("a thinking block opened by itself");
 await waitFor(p1, (abs) => document.querySelector('.msgs .msg.assistant code.local-path[data-local-path="src/a.js"][data-line="3"][data-abs="' + abs + '"]'),
   "existing inline-code path marked as local", 10000, path.join(tmp, "src", "a.js"));
 if (await p1.evaluate(() => !!document.querySelector('.msgs code.local-path[data-local-path="src/missing.js"]'))) await fail("a path that does not exist is clickable");

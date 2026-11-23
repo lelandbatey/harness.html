@@ -317,6 +317,7 @@
   // ---- events ----------------------------------------------------------------------------------
 
   function forCur(d) { return cur && !cur.loading && d.session_id === cur.id; }
+  function forCurBranch(d) { return forCur(d) && (!d.branch_id || !cur.branchId || d.branch_id === cur.branchId); }
 
   function onEvent(name, d) {
     switch (name) {
@@ -356,29 +357,42 @@
         }
         if (cur) updateHeader();
         break;
-      case "message.added":
+      case "branches.updated":
         if (!forCur(d)) break;
+        cur.branches = d.branches || cur.branches;
+        if (cur.branches && cur.branches.active_branch_id) cur.branchId = cur.branches.active_branch_id;
+        renderForkMarks();
+        renderMinimap();
+        updateHeader();
+        break;
+      case "branch.switched":
+        if (!forCur(d)) break;
+        applyBranchSwitch(d, true);
+        break;
+      case "message.added":
+        if (!forCurBranch(d)) break;
         if (cur.messages.some(function (m) { return m.id === d.id; })) break;
         if (d.role === "assistant" && cur.draft) { cur.draft = null; renderDraft(); }
         cur.messages.push(d);
         appendMessage(d);
         renderTurnMarks();
+        renderForkMarks();
         updateTurnTimer(S.sessions.get(cur.id));
         if (d.role === "user" && !isToolResultMsg(d)) cur.stick = true;
         afterContent();
         break;
       case "messages.truncated":
-        if (!forCur(d)) break;
+        if (!forCurBranch(d)) break;
         cur.messages = cur.messages.filter(function (m) { return m.id < d.from_id; });
         renderMessages();
         break;
       case "draft.start":
-        if (!forCur(d)) break;
+        if (!forCurBranch(d)) break;
         cur.draft = { turn_id: d.turn_id, content: [] };
         renderDraft();
         break;
       case "draft.block":
-        if (!forCur(d) || !cur.draft) break;
+        if (!forCurBranch(d) || !cur.draft) break;
         var blk = Object.assign({}, d.block);
         if (blk.type === "text" && blk.text == null) blk.text = "";
         if (blk.type === "thinking" && blk.thinking == null) blk.thinking = "";
@@ -386,7 +400,7 @@
         markDirty(d.index);
         break;
       case "draft.delta": {
-        if (!forCur(d) || !cur.draft) break;
+        if (!forCurBranch(d) || !cur.draft) break;
         var b = cur.draft.content[d.index];
         if (!b) b = cur.draft.content[d.index] = { type: d.thinking != null ? "thinking" : d.partial_json != null ? "tool_use" : "text" };
         if (d.text != null) b.text = (b.text || "") + d.text;
@@ -397,18 +411,18 @@
         break;
       }
       case "tool.start": case "tool.end":
-        if (!forCur(d)) break;
+        if (!forCurBranch(d)) break;
         cur.tools[d.tool_use_id] = { started_at: d.started_at, ended_at: d.ended_at };
         var tc = cur.toolCards.get(d.tool_use_id);
         if (tc) setToolTiming(tc, cur.tools[d.tool_use_id]);
         break;
       case "draft.end":
-        if (!forCur(d)) break;
+        if (!forCurBranch(d)) break;
         cur.draft = null;
         renderDraft();
         break;
       case "queue.updated":
-        if (!forCur(d)) break;
+        if (!forCurBranch(d)) break;
         cur.queue = d.queue || [];
         renderQueue();
         break;
@@ -416,11 +430,11 @@
         applyOnboarding(d);
         break;
       case "notice":
-        if (d.session_id && cur && d.session_id === cur.id) addNotice(d);
+        if (d.session_id && cur && d.session_id === cur.id && (!d.branch_id || !cur.branchId || d.branch_id === cur.branchId)) addNotice(d);
         else if (!d.session_id) toast(d.text, d.level);
         break;
       case "btw.start": case "btw.delta": case "btw.end":
-        if (forCur(d)) onBtw(name, d);
+        if (forCurBranch(d)) onBtw(name, d);
         break;
     }
   }
@@ -435,7 +449,10 @@
   }
   function parseHash() {
     var h = location.hash.replace(/^#\/?/, "");
-    if (h.indexOf("session/") === 0) return { name: "session", id: decodeURIComponent(h.slice(8)) };
+    if (h.indexOf("session/") === 0) {
+      var parts = h.slice(8).split("/");
+      return { name: "session", id: decodeURIComponent(parts[0]), bid: parts[1] ? decodeURIComponent(parts[1]) : null };
+    }
     if (h === "sessions" || h === "settings" || h === "new" || h === "about" || h === "setup") return { name: h };
     return null;
   }
@@ -453,14 +470,20 @@
       history.replaceState(null, "", S.sessions.size ? "#sessions" : "#new");
       r = parseHash();
     }
-    var same = S.route && S.route.name === r.name && S.route.id === r.id;
+    var same = S.route && S.route.name === r.name && S.route.id === r.id && S.route.bid === r.bid;
     S.route = r;
     if (same && !force) return;
+    // Per-tab thread switch inside the already-open session: stay mounted and slide sideways!
+    if (!force && cur && r.name === "session" && r.id === cur.id) {
+      loadBranchInTab(r.bid, true);
+      renderSidebar();
+      return;
+    }
     if (cur && (r.name !== "session" || r.id !== cur.id || force)) closeChat(r.name === "session" && r.id === cur.id);
     $("#nav-sessions").classList.toggle("active", r.name === "sessions");
     $("#nav-settings").classList.toggle("active", r.name === "settings");
     $("#nav-about").classList.toggle("active", r.name === "about");
-    if (r.name === "session") openChat(r.id);
+    if (r.name === "session") openChat(r.id, r.bid);
     else if (r.name === "new") renderNew();
     else if (r.name === "sessions") renderSessions();
     else if (r.name === "settings") renderSettings();
@@ -556,10 +579,46 @@
     renderSidebar();
     if (S.route && S.route.name === "sessions") renderSessionsGrid();
   }
+  function orderThreadsTree(list) {
+    var byId = new Map((list || []).map(function (b) { return [b.id, b]; }));
+    var kids = new Map(), roots = [];
+    (list || []).forEach(function (b) {
+      if (b.parent_branch_id && b.parent_branch_id !== b.id && byId.has(b.parent_branch_id)) {
+        if (!kids.has(b.parent_branch_id)) kids.set(b.parent_branch_id, []);
+        kids.get(b.parent_branch_id).push(b);
+      } else roots.push(b);
+    });
+    kids.forEach(function (arr) {
+      arr.sort(function (a, b) {
+        return (a.origin_depth || 0) - (b.origin_depth || 0) || (a.created_at || 0) - (b.created_at || 0);
+      });
+    });
+    var ordered = [], seen = new Set();
+    function walk(b, depth) {
+      if (seen.has(b.id)) return;
+      seen.add(b.id);
+      ordered.push({ b: b, depth: depth });
+      (kids.get(b.id) || []).forEach(function (k) { walk(k, depth + 1); });
+    }
+    roots.forEach(function (r) { walk(r, 0); });
+    (list || []).forEach(function (b) { if (!seen.has(b.id)) walk(b, 0); });
+    return { ordered: ordered, kids: kids };
+  }
+
+  function threadGlyph(t) {
+    if (t.is_main || t.kind === "main") return "●";
+    if (t.kind === "subagent") return t.context_mode === "fresh" ? "◌" : "⑂";
+    if (t.kind === "edit") return "↺";
+    return "⑂";
+  }
+
   function treeToggle(n) {
-    if (!n.kids.length) return null;
+    var threads = (n.s.threads && n.s.threads.length > 1) ? n.s.threads : [];
+    var count = n.kids.length + (threads.length > 1 ? threads.length : 0);
+    if (!count) return null;
     var closed = treeCollapsed(n.s.id);
-    return el("button", { class: "tree-tog", type: "button", title: (closed ? "Show " : "Hide ") + n.kids.length + " subagent" + (n.kids.length === 1 ? "" : "s"),
+    var what = threads.length > 1 ? threads.length + " threads" : n.kids.length + " subagent" + (n.kids.length === 1 ? "" : "s");
+    return el("button", { class: "tree-tog", type: "button", title: (closed ? "Show " : "Hide ") + what,
       "aria-expanded": closed ? "false" : "true", text: closed ? "▸" : "▾",
       onclick: function (e) { e.preventDefault(); e.stopPropagation(); toggleTree(n.s.id); } });
   }
@@ -567,19 +626,40 @@
   function renderSidebar() {
     var ul = $("#sb-list");
     var activeId = S.route && S.route.name === "session" ? S.route.id : null;
+    var activeBid = cur && cur.id === activeId ? cur.branchId : (S.route && S.route.bid);
     ul.textContent = "";
     function add(n, depth) {
       var s = n.s;
+      var threads = s.threads && s.threads.length > 1 ? s.threads : [];
       var a = el("a", { href: "#session/" + encodeURIComponent(s.id), title: titleOf(s) + (s.cwd ? "\n" + s.cwd : ""),
-        class: s.id === activeId ? "active" : null, "data-sid": s.id },
+        class: s.id === activeId && !threads.length ? "active" : (s.id === activeId && !activeBid ? "active" : null), "data-sid": s.id },
         svgEl(iconSvg(s, 16)),
         el("span", { class: "t" + (s.title ? "" : " untitled"), text: titleOf(s) }),
         n.kids.length ? el("span", { class: "kids-count", title: n.kids.length + " subagent" + (n.kids.length === 1 ? "" : "s"), text: String(n.kids.length) }) : null,
+        s.branch_count > 1 ? el("span", { class: "branch-count", title: s.branch_count + " threads", text: "⑂" + s.branch_count }) : null,
         inboxBadge(s), peerBadge(s),
         s.status === "running" ? el("span", { class: "status-dot", title: "running" }) : null);
       var li = el("li", { class: depth ? "child" : null, style: depth ? "--depth:" + depth : null }, treeToggle(n), a);
       ul.append(li);
-      if (!treeCollapsed(s.id)) n.kids.forEach(function (k) { add(k, depth + 1); });
+      if (!treeCollapsed(s.id)) {
+        if (threads.length > 1) {
+          var cmap = branchLaneMap(threads);
+          orderThreadsTree(threads).ordered.forEach(function (item) {
+            var t = item.b;
+            var isCur = s.id === activeId && activeBid === t.id;
+            var col = laneColor(cmap.get(t.id) || 0);
+            var href = "#session/" + encodeURIComponent(s.id) + "/" + encodeURIComponent(t.id);
+            var tip = t.name + " (" + t.kind + (t.kind === "subagent" ? " · " + (t.context_mode || "fresh") : "") + ")";
+            var ta = el("a", { href: href, class: isCur ? "active" : null, title: tip, "data-sid": s.id, "data-bid": t.id },
+              el("span", { class: "th-ico", style: "--lane-color:" + col, text: threadGlyph(t) }),
+              el("span", { class: "t", text: t.name }),
+              t.kind === "subagent" ? el("span", { class: "th-tag", text: t.context_mode === "fresh" ? "sub" : "fork" }) : null,
+              t.status === "running" ? el("span", { class: "status-dot", title: "running" }) : null);
+            ul.append(el("li", { class: "thread-item", style: "--depth:" + (depth + 1 + Math.min(3, item.depth)) }, ta));
+          });
+        }
+        n.kids.forEach(function (k) { add(k, depth + 1); });
+      }
     }
     sessionTree(sortedSessions()).forEach(function (n) { add(n, 0); });
     if (!S.sessions.size) ul.append(el("li", { class: "muted small", style: "padding:6px 10px", text: "No sessions yet" }));
@@ -684,7 +764,8 @@
   function buildChat(opts) {
     var c = {
       id: opts.id || null, messages: [], draft: null, queue: [], loading: true, stick: true,
-      toolCards: new Map(), dirty: new Set(), draftEls: [], raf: 0, tools: {}, skew: 0
+      toolCards: new Map(), dirty: new Set(), draftEls: [], raf: 0, tools: {}, skew: 0,
+      branchId: null, branches: null, offlineBranches: null, minimapExpanded: LS.get("minimapExpanded", false)
     };
     c.head = el("header", { class: "chat-head" });
     c.msgsEl = el("div", { class: "msgs" });
@@ -692,6 +773,7 @@
     c.queueEl = el("div", { class: "queue-host" });
     c.inboxEl = el("div", { class: "inbox-host" });
     c.peersEl = el("div", { class: "peer-strip", hidden: true });
+    c.minimapEl = el("aside", { class: "branch-minimap", hidden: true, "aria-label": "Branch minimap" });
     c.jump = el("button", { class: "jump-bottom", type: "button", title: "Jump to latest", hidden: true, text: "↓",
       onclick: function () { c.stick = true; scrollBottom(); } });
     c.inner = el("div", { class: "chat-inner" }, opts.before || null, c.msgsEl, c.draftEl, c.queueEl, c.inboxEl);
@@ -701,6 +783,7 @@
       c.stick = atBottom;
       c.jump.hidden = atBottom;
     });
+    c.body = el("div", { class: "chat-body" }, c.scroll, c.minimapEl);
     c.ta = el("textarea", { rows: 1, placeholder: opts.placeholder || "Message…  (/ for commands)", "aria-label": "Message" });
     c.sendBtn = el("button", { class: "btn primary", type: "button", text: "Send", onclick: function () { sendComposer(); } });
     c.stopBtn = el("button", { class: "btn danger", type: "button", text: "Stop", title: "Stop (Esc)", hidden: true,
@@ -717,7 +800,7 @@
     c.costEl = el("span", { class: "session-cost" });
     c.ctxEl = el("span", { class: "session-ctx" });
     c.turnEl = el("span", { class: "session-turn", hidden: true, title: "How long the current turn has been running" });
-    c.root = el("div", { class: "view chat" }, c.head, c.peersEl, c.scroll, c.composer, el("div", { class: "chat-foot" }, c.turnEl, c.ctxEl, c.costEl));
+    c.root = el("div", { class: "view chat" }, c.head, c.peersEl, c.body, c.composer, el("div", { class: "chat-foot" }, c.turnEl, c.ctxEl, c.costEl));
     c.ta.addEventListener("input", function () { autoGrow(c.ta); updatePopup(); });
     c.ta.addEventListener("keydown", composerKeydown);
     return c;
@@ -728,7 +811,7 @@
     ta.style.height = Math.min(ta.scrollHeight, window.innerHeight * 0.4) + "px";
   }
 
-  function openChat(id) {
+  function openChat(id, bid) {
     var c = buildChat({ id: id });
     newView = null;
     cur = c;
@@ -739,19 +822,32 @@
     updateComposer();
     S.lastSession = id;
     if (S.offline) c.composer.hidden = true;
-    var sub = S.offline
-      ? Promise.resolve({ session: S.sessions.get(id), messages: ((S.offlineData && S.offlineData.messages) || {})[id] || [], draft: null, queue: [] })
-      : rpc("sessions.subscribe", { session_id: id });
+    var offBd = S.offline && S.offlineData && S.offlineData.branches ? S.offlineData.branches[id] : null;
+    var sub;
+    if (S.offline) {
+      var offBid = bid && offBd && offBd.threads && offBd.threads[bid] ? bid : (offBd && offBd.info ? offBd.info.active_branch_id : null);
+      var offMsgs = offBd && offBid && offBd.threads[offBid]
+        ? offBd.threads[offBid].map(function (mid) { return offBd.messages[String(mid)]; }).filter(Boolean)
+        : (((S.offlineData && S.offlineData.messages) || {})[id] || []);
+      var offInfo = offBd && offBid ? recomputeOfflineBranches(offBd, offBid) : (offBd ? offBd.info : null);
+      sub = Promise.resolve({ session: S.sessions.get(id), messages: offMsgs, draft: null, queue: [], branches: offInfo, branch_id: offBid });
+    } else {
+      sub = rpc("sessions.subscribe", bid ? { session_id: id, branch_id: bid } : { session_id: id });
+    }
     sub.then(function (snap) {
       if (cur !== c) return;
       c.loading = false;
+      if (offBd) c.offlineBranches = offBd;
       if (snap.session) S.sessions.set(id, snap.session);
+      c.branchId = snap.branch_id || (snap.branches && snap.branches.active_branch_id) || null;
+      c.branches = snap.branches || null;
       c.messages = snap.messages || [];
       c.draft = snap.draft || null;
       c.queue = snap.queue || [];
       c.tools = snap.tools || {};
       if (snap.now) c.skew = snap.now - Date.now();
       renderMessages();
+      renderMinimap();
       renderQueue();
       updateHeader();
       updateComposer();
@@ -767,6 +863,25 @@
     });
   }
 
+  function loadBranchInTab(bid, animate) {
+    var c = cur;
+    if (!c) return;
+    if (bid && bid === c.branchId) return;
+    if (S.offline) {
+      var bd = c.offlineBranches;
+      if (!bd || !bd.threads) return;
+      var target = bid && bd.threads[bid] ? bid : bd.info.active_branch_id;
+      if (!target || !bd.threads[target]) return;
+      var msgs = bd.threads[target].map(function (id) { return bd.messages[String(id)]; }).filter(Boolean);
+      var info = recomputeOfflineBranches(bd, target);
+      applyBranchSwitch({ branch_id: target, branches: info, messages: msgs, draft: null, queue: [], tools: {} }, animate);
+      return;
+    }
+    rpcToast("sessions.subscribe", bid ? { session_id: c.id, branch_id: bid } : { session_id: c.id }).then(function (snap) {
+      if (cur === c) applyBranchSwitch(snap, animate);
+    }).catch(function () {});
+  }
+
   function updateHeader() {
     if (!cur) return;
     var s = S.sessions.get(cur.id) || { id: cur.id, title: "" };
@@ -775,7 +890,7 @@
     var titleBtn = el("button", { class: "chat-title", type: "button", title: "Click to rename", text: titleOf(s), onclick: startRename });
     var running = s.status === "running";
     var parent = s.parent_id ? S.sessions.get(s.parent_id) : null;
-    h.append(svgEl(iconSvg(s, 32)),
+    append(h, [svgEl(iconSvg(s, 32)),
       el("div", { class: "info" }, titleBtn,
         el("div", { class: "chat-meta" },
           s.parent_id ? el("span", { class: "sub-of" }, "subagent of ",
@@ -785,9 +900,10 @@
               text: tildify(s.cwd), onclick: changeSessionCwd })) : null,
           providerBadge(s),
           effortControl(s),
+          branchHeaderBadge(s),
           S.offline ? el("span", { class: "badge", text: "read only" }) : el("span", { class: "badge" + (running ? " running" : ""), text: running ? "running" : "idle" }))),
       S.offline ? null : el("button", { class: "btn sm", type: "button", title: "Open a shell in this session's directory", text: "Terminal",
-        onclick: function () { openTerminal({ cmd: "shell", cwd: s.cwd, title: "shell · " + tildify(s.cwd) }); } }));
+        onclick: function () { openTerminal({ cmd: "shell", cwd: s.cwd, title: "shell · " + tildify(s.cwd) }); } })]);
     setPageMeta(titleOf(s), IC.dataUrl(s, 32));
     if (running && !S.offline) animateFavicon(s);
     renderPeerStrip();
@@ -974,14 +1090,23 @@
       });
   }
 
+  function curThreadRunning() {
+    if (!cur) return false;
+    if (cur.branches && cur.branches.branches) {
+      var active = cur.branches.branches.find(function (b) { return b.id === cur.branchId; });
+      if (active) return active.status === "running";
+    }
+    var s = S.sessions.get(cur.id);
+    return !!(s && (s.active_status ? s.active_status === "running" : s.status === "running"));
+  }
+
   function updateComposer() {
     if (newView && !cur) {
       newView.sendBtn.textContent = providerReady() ? "Send" : "Set up a provider →";
       return;
     }
     if (!cur) return;
-    var s = S.sessions.get(cur.id);
-    var running = !!(s && s.status === "running");
+    var running = curThreadRunning();
     cur.stopBtn.hidden = !running;
     cur.sendBtn.disabled = !S.connected;
     cur.sendBtn.textContent = !providerReady() ? "Set up a provider →" : running ? "Queue" : "Send";
@@ -1004,6 +1129,7 @@
     }
     renderDraft();
     renderTurnMarks();
+    renderForkMarks();
     c.stick = true;
     afterContent();
   }
@@ -1050,7 +1176,479 @@
     }
     if (isPeerMsg(m)) { c.msgsEl.append(peerMsgEl(m)); return; }
     var sr = m.role === "user" ? parseSubResult(userText(m)) : null;
-    c.msgsEl.append(sr ? subResultCard(m, sr) : m.role === "user" ? userBubble(m) : assistantMsg(m));
+    var br = !sr && m.role === "user" ? parseBranchResult(userText(m)) : null;
+    c.msgsEl.append(sr ? subResultCard(m, sr) : br ? branchResultCard(m, br) : m.role === "user" ? userBubble(m) : assistantMsg(m));
+  }
+
+  // ---- unified session threads (/aside + subagents) + two-mode minimap (v16/v17) ---------------
+
+  var LANE_COLORS = ["var(--accent)", "#2c9a5a", "#d97706", "#9333ea", "#0891b2", "#e11d48"];
+  function laneColor(i) { return LANE_COLORS[Math.abs(i || 0) % LANE_COLORS.length]; }
+  function threadHref(sid, bid) { return "#session/" + encodeURIComponent(sid) + "/" + encodeURIComponent(bid); }
+
+  function parseBranchResult(text) {
+    var m = /^<(?:branch-result|thread-message)((?:\s+[\w-]+=(?:"[^"]*"|'[^']*'))*)\s*>([\s\S]*?)(?:<\/(?:branch-result|thread-message)>\s*)?$/.exec(text || "");
+    if (!m) return null;
+    var attrs = {}, re = /([\w-]+)=(?:"([^"]*)"|'([^']*)')/g, a;
+    while ((a = re.exec(m[1]))) attrs[a[1]] = unescAttr(a[2] != null ? a[2] : a[3]);
+    return { branch_id: attrs.from || attrs.branch_id || "", title: attrs.title || "",
+      kind: attrs.kind || "branch", status: attrs.status || "", body: m[2] };
+  }
+  function isBranchResultMsg(m) { return m.role === "user" && !!parseBranchResult(userText(m)); }
+  function branchResultCard(m, r) {
+    var st = r.status || "completed";
+    var kind = r.kind || "branch";
+    var lbl = kind === "subagent" ? "Subagent report" : kind === "aside" ? "Aside report" : "Thread message";
+    var jump = r.branch_id && cur
+      ? el("a", { class: "link-btn branch-jump", href: threadHref(cur.id, r.branch_id), text: "Open thread →" })
+      : null;
+    return el("div", { class: "msg subresult", "data-mid": m.id },
+      el("div", { class: "subresult-card branch-result-card kind-" + kind + (st === "completed" ? "" : " " + st) },
+        el("div", { class: "subresult-head" },
+          el("span", { class: "lbl", text: lbl }),
+          el("span", { class: "desc", text: r.title || r.branch_id || "thread" }),
+          el("span", { class: "badge st-" + st, text: st }),
+          jump),
+        mdDiv(r.body.trim() || "(no output)", null, m.links)));
+  }
+
+  function branchHeaderBadge(s) {
+    if (!cur || !cur.branches || !cur.branches.branches || cur.branches.branches.length <= 1) return null;
+    var list = cur.branches.branches;
+    var active = list.find(function (b) { return b.id === cur.branchId; }) || list[0];
+    var isAside = active && !active.is_main && active.kind !== "subagent";
+    var isSub = active && active.kind === "subagent";
+    var lbl = threadGlyph(active) + " " + (active ? active.name : "Main") + " · " + list.length;
+    return el("button", { class: "badge branch-btn" + (isAside ? " is-aside" : "") + (isSub ? " is-subagent" : ""),
+      type: "button",
+      title: (active ? active.name + " (" + active.kind + (isSub ? ", " + (active.context_mode || "fresh") + " context" : "") + ")" : "") +
+        "\nClick to " + (cur.minimapExpanded ? "minimize" : "expand") + " the thread graph sidebar",
+      onclick: function () { setMinimapExpanded(!cur.minimapExpanded); }, text: lbl });
+  }
+
+  function setMinimapExpanded(exp) {
+    if (!cur) return;
+    cur.minimapExpanded = !!exp;
+    LS.set("minimapExpanded", cur.minimapExpanded);
+    renderMinimap();
+    updateHeader();
+  }
+
+  function branchLaneMap(branchesList) {
+    var map = new Map();
+    if (!branchesList) return map;
+    var nextLane = 1;
+    branchesList.forEach(function (b) {
+      if (b.is_main || b.kind === "main") map.set(b.id, 0);
+      else map.set(b.id, nextLane++);
+    });
+    return map;
+  }
+
+  function applyBranchSwitch(snap, animate) {
+    var c = cur;
+    if (!c) return;
+    if (snap.session) S.sessions.set(c.id, snap.session);
+    c.branchId = snap.branch_id || (snap.branches && snap.branches.active_branch_id) || c.branchId;
+    c.branches = snap.branches || c.branches;
+    c.messages = snap.messages || [];
+    c.draft = snap.draft || null;
+    c.queue = snap.queue || [];
+    c.tools = snap.tools || {};
+    if (snap.now) c.skew = snap.now - Date.now();
+    // Keep URL hash synced with this tab's viewed thread without adding redundant history entries
+    if (c.branchId) {
+      var want = threadHref(c.id, c.branchId);
+      if (location.hash !== want && S.route && S.route.name === "session" && S.route.id === c.id) {
+        S.route.bid = c.branchId;
+        history.replaceState(null, "", want);
+      }
+    }
+    renderMessages();
+    renderMinimap();
+    renderQueue();
+    updateHeader();
+    updateComposer();
+    renderSidebar();
+    if (animate && c.inner) {
+      c.inner.classList.remove("branch-slide");
+      void c.inner.offsetWidth;
+      c.inner.classList.add("branch-slide");
+    }
+  }
+
+  function switchBranch(bid) {
+    var c = cur;
+    if (!c || !bid || bid === c.branchId) return;
+    // Per-tab navigation via hash: updates only THIS tab (and integrates with browser Back/Forward)
+    location.hash = threadHref(c.id, bid);
+  }
+
+  function recomputeOfflineBranches(bd, activeBid) {
+    var activePath = bd.threads[activeBid] || [];
+    var activeSet = new Set(activePath);
+    var branches = bd.info.branches.map(function (b) { return Object.assign({}, b, { is_active: b.id === activeBid }); });
+    var byId = {};
+    branches.forEach(function (b) { byId[b.id] = b; });
+    var forks = {};
+    var grouped = new Map();
+    branches.forEach(function (b) {
+      if (b.id === activeBid) return;
+      if (b.context_mode === "fresh") {
+        var attach = b.spawned_at_id;
+        var fkey = attach != null && activeSet.has(attach) ? String(attach) : (b.parent_branch_id === activeBid ? "root" : null);
+        if (fkey) {
+          var fgk = fkey + "|f:" + b.id;
+          grouped.set(fgk, { key: fkey, bids: [b.id] });
+        }
+        return;
+      }
+      var p = bd.threads[b.id] || [];
+      if (b.kind === "subagent" && b.spawned_at_id != null && activeSet.has(b.spawned_at_id)) {
+        grouped.set(String(b.spawned_at_id) + "|sub:" + b.id, { key: String(b.spawned_at_id), bids: [b.id] });
+        return;
+      }
+      var lca = null;
+      for (var i = p.length - 1; i >= 0; i--) if (activeSet.has(p[i])) { lca = p[i]; break; }
+      var key = lca != null ? String(lca) : "root";
+      var idx = lca != null ? p.indexOf(lca) : -1;
+      var fa = idx + 1 < p.length ? p[idx + 1] : null;
+      var gkey = key + "|" + (fa != null ? "m:" + fa : "s:" + b.id);
+      if (!grouped.has(gkey)) grouped.set(gkey, { key: key, bids: [] });
+      grouped.get(gkey).bids.push(b.id);
+    });
+    grouped.forEach(function (g) {
+      g.bids.sort(function (a, b) {
+        var sa = byId[a], sb = byId[b];
+        return (sa.is_main ? 0 : 1) - (sb.is_main ? 0 : 1) || (sa.created_at || 0) - (sb.created_at || 0);
+      });
+      var rep = byId[g.bids[0]];
+      if (!forks[g.key]) forks[g.key] = [];
+      forks[g.key].push({ branch_id: rep.id, name: rep.name, kind: rep.kind, context_mode: rep.context_mode || "fork",
+        status: "idle", own_messages: rep.own_messages, is_main: rep.is_main, nested: g.bids.length - 1 });
+    });
+    var act = byId[activeBid];
+    return { active_branch_id: activeBid, main_branch_id: bd.info.main_branch_id,
+      active_origin_id: act ? act.origin_id : null, active_context_mode: act ? act.context_mode : "fork",
+      branches: branches, forks: forks };
+  }
+
+  function startAsideFrom(mid) {
+    var c = cur;
+    if (!c || S.offline) return;
+    rpcToast("branches.create", { session_id: c.id, from_message_id: mid == null ? undefined : mid,
+      parent_branch_id: c.branchId || undefined }).then(function (r) {
+      if (cur === c && r && r.snapshot) {
+        if (cur.branchId !== r.snapshot.branch_id) applyBranchSwitch(r.snapshot, true);
+        c.ta.focus();
+      }
+    }).catch(function () {});
+  }
+
+  function renameBranch(bid, currentName) {
+    var c = cur;
+    if (!c || S.offline) return;
+    var next = prompt("Thread title:", currentName || "");
+    if (!next || !next.trim() || next.trim() === currentName) return;
+    rpcToast("branches.rename", { session_id: c.id, branch_id: bid, title: next.trim() }).catch(function () {});
+  }
+
+  function promoteBranch(bid) {
+    var c = cur;
+    if (!c || S.offline) return;
+    rpcToast("branches.promote", { session_id: c.id, branch_id: bid }).then(function () {
+      toast("Set as main thread");
+    }).catch(function () {});
+  }
+
+  function deleteBranch(bid, name) {
+    var c = cur;
+    if (!c || S.offline) return;
+    if (!confirm('Delete thread "' + (name || bid) + '"? Messages unique to this thread will be removed.')) return;
+    rpcToast("branches.delete", { session_id: c.id, branch_id: bid }).catch(function () {});
+  }
+
+  function findMsgAnchor(c, mid) {
+    var byId = {};
+    c.messages.forEach(function (m, i) { byId[m.id] = i; });
+    var start = byId[mid];
+    if (start === undefined) return null;
+    for (var i = start; i >= 0; i--) {
+      var els = c.msgsEl.querySelectorAll('[data-mid="' + c.messages[i].id + '"]');
+      if (els.length) return els[els.length - 1];
+    }
+    return null;
+  }
+
+  function renderForkMarks() {
+    var c = cur;
+    if (!c || !c.msgsEl) return;
+    c.msgsEl.querySelectorAll(".branch-fork, .branch-origin-div").forEach(function (e) { e.remove(); });
+    if (!c.branches || !c.branches.branches || c.branches.branches.length <= 1) return;
+    var info = c.branches;
+    var lanes = branchLaneMap(info.branches);
+    var active = info.branches.find(function (b) { return b.id === c.branchId; });
+
+    // 1. Active thread origin banner/divider
+    if (active && !active.is_main) {
+      var parentB = active.parent_branch_id ? info.branches.find(function (b) { return b.id === active.parent_branch_id; }) : null;
+      var kindLbl = active.kind === "subagent" ? ("subagent · " + (active.context_mode || "fresh") + " context")
+        : active.kind === "edit" ? "version" : "aside";
+      var div = el("div", { class: "branch-origin-div", "data-branch-origin": active.id },
+        el("span", null, (active.context_mode === "fresh" ? "◌ " : "↳ ") + kindLbl + ": ", el("strong", { text: active.name })),
+        parentB ? el("a", { class: "bact", href: threadHref(c.id, parentB.id), title: "Back to " + parentB.name,
+          text: "← " + parentB.name }) : null,
+        S.offline ? null : el("button", { class: "bact", type: "button", title: "Make this the main thread", text: "Set as main",
+          onclick: function () { promoteBranch(active.id); } }),
+        S.offline ? null : el("button", { class: "bact", type: "button", title: "Rename this thread", text: "Rename",
+          onclick: function () { renameBranch(active.id, active.name); } }));
+      if (active.origin_id != null) {
+        var anchor = findMsgAnchor(c, active.origin_id);
+        if (anchor) anchor.after(div);
+        else c.msgsEl.prepend(div);
+      } else {
+        c.msgsEl.prepend(div);
+      }
+    }
+
+    // 2. Inline fork/spawn strips along the displayed thread
+    var forks = info.forks || {};
+    Object.keys(forks).forEach(function (key) {
+      var chips = forks[key];
+      if (!chips || !chips.length) return;
+      var total = chips.reduce(function (acc, ch) { return acc + 1 + (ch.nested || 0); }, 0);
+      var strip = el("div", { class: "branch-fork", "data-fork-at": key },
+        el("span", { class: "branch-fork-lbl", text: "⑂ " + total + " thread" + (total === 1 ? "" : "s") }));
+      chips.forEach(function (ch) {
+        var col = laneColor(lanes.get(ch.branch_id) || 1);
+        var isFresh = ch.context_mode === "fresh";
+        var btn = el("a", { class: "branch-chip" + (ch.is_main ? " is-main" : "") + (isFresh ? " is-fresh" : ""),
+          href: threadHref(c.id, ch.branch_id), style: "--lane-color:" + col, "data-branch-id": ch.branch_id,
+          title: ch.name + " (" + ch.kind + (ch.kind === "subagent" ? ", " + (ch.context_mode || "fresh") + " context" : "") +
+            ", " + ch.own_messages + " message" + (ch.own_messages === 1 ? "" : "s") +
+            (ch.nested ? ", +" + ch.nested + " sub-thread" + (ch.nested === 1 ? "" : "s") : "") +
+            ")\nClick to switch this tab · middle-click to open in a new tab" },
+          el("span", { class: "bdot" }),
+          el("span", { class: "bname", text: ch.name }),
+          ch.is_main ? el("span", { class: "btag", text: "main" }) : (ch.kind === "subagent" ? el("span", { class: "btag", text: isFresh ? "sub·fresh" : "sub·fork" }) : null),
+          ch.status === "running" ? el("span", { class: "status-dot", title: "running" }) : null,
+          el("span", { class: "bmeta", text: ch.own_messages + "m" + (ch.nested ? " +" + ch.nested : "") }));
+        strip.append(btn);
+      });
+      if (!S.offline && key !== "root") {
+        strip.append(el("button", { class: "branch-add", type: "button", title: "Start another aside from this message",
+          text: "+ Aside", onclick: function () { startAsideFrom(Number(key)); } }));
+      }
+      if (key === "root") {
+        c.msgsEl.prepend(strip);
+      } else {
+        var anchor = findMsgAnchor(c, Number(key));
+        if (anchor) anchor.after(strip);
+      }
+    });
+  }
+
+  // Build SVG markup for the thread graph (shared by both minimal translucent mode and expanded sidebar)
+  function buildGraphSvg(ordered, kids, colorMap, opts) {
+    var ROW_H = opts.rowH, PAD_X = opts.padX, LANE_W = opts.laneW, mini = !!opts.mini;
+    var rowOf = new Map(), laneOf = new Map(), maxLane = 0;
+    ordered.forEach(function (item, idx) {
+      rowOf.set(item.b.id, idx);
+      var lane = item.b.is_main ? 0 : Math.min(4, Math.max(1, item.depth));
+      laneOf.set(item.b.id, lane);
+      if (lane > maxLane) maxLane = lane;
+    });
+    var graphW = PAD_X * 2 + maxLane * LANE_W;
+    var barArea = mini ? 34 : 0;
+    var svgW = graphW + barArea;
+    var svgH = ordered.length * ROW_H;
+    var svgParts = [];
+
+    // Vertical trunks for parent threads down to their last direct child
+    ordered.forEach(function (item, idx) {
+      var b = item.b, ch = kids.get(b.id) || [];
+      if (!ch.length) return;
+      var lastIdx = idx;
+      ch.forEach(function (k) { if (rowOf.has(k.id) && rowOf.get(k.id) > lastIdx) lastIdx = rowOf.get(k.id); });
+      if (lastIdx > idx) {
+        var px = PAD_X + laneOf.get(b.id) * LANE_W;
+        var y0 = idx * ROW_H + ROW_H / 2;
+        var y1 = lastIdx * ROW_H + ROW_H / 2 - (mini ? 6 : 14);
+        var pcol = laneColor(colorMap.get(b.id) || 0);
+        if (y1 > y0) {
+          svgParts.push('<line x1="' + px + '" y1="' + y0 + '" x2="' + px + '" y2="' + y1 +
+            '" stroke="' + pcol + '" stroke-width="' + (mini ? 1.5 : (b.is_active ? 2.4 : 1.7)) + '" stroke-opacity="0.45" stroke-linecap="round"/>');
+        }
+      }
+    });
+
+    // Curved parent -> child connectors (solid = forked context, dashed = fresh context!)
+    ordered.forEach(function (item, idx) {
+      var b = item.b;
+      var x = PAD_X + laneOf.get(b.id) * LANE_W;
+      var y = idx * ROW_H + ROW_H / 2;
+      var col = laneColor(colorMap.get(b.id) || 0);
+      var isFresh = b.context_mode === "fresh";
+      var dash = isFresh ? (mini ? ' stroke-dasharray="2 2"' : ' stroke-dasharray="3.5 2.5"') : "";
+      var pId = b.parent_branch_id;
+      if (pId && rowOf.has(pId)) {
+        var px = PAD_X + laneOf.get(pId) * LANE_W;
+        var py = Math.max(rowOf.get(pId) * ROW_H + ROW_H / 2, y - ROW_H * 0.72);
+        var midY = (py + y) / 2;
+        svgParts.push('<path d="M' + px + ',' + py + ' C' + px + ',' + midY + ' ' + x + ',' + midY + ' ' + x + ',' + y +
+          '" fill="none" stroke="' + col + '" stroke-width="' + (mini ? (b.is_active ? 2 : 1.3) : (b.is_active ? 2.4 : 1.7)) +
+          '" stroke-opacity="' + (b.is_active ? "1" : "0.78") + '"' + dash + ' stroke-linecap="round"/>');
+      } else if (idx > 0) {
+        var rx = PAD_X, ry = ROW_H / 2;
+        svgParts.push('<path d="M' + rx + ',' + ry + ' C' + rx + ',' + (ry + 8) + ' ' + x + ',' + (y - 8) + ' ' + x + ',' + y +
+          '" fill="none" stroke="' + col + '" stroke-width="1.4" stroke-dasharray="2.5 2" stroke-opacity="0.6"/>');
+      }
+    });
+
+    // Nodes + (in minimal mode) Sublime Text-style miniature proportional bars
+    var maxMsgs = Math.max(1, ordered.reduce(function (m, it) { return Math.max(m, it.b.own_messages || 1); }, 1));
+    ordered.forEach(function (item, idx) {
+      var b = item.b;
+      var x = PAD_X + laneOf.get(b.id) * LANE_W;
+      var y = idx * ROW_H + ROW_H / 2;
+      var col = laneColor(colorMap.get(b.id) || 0);
+      var isFresh = b.context_mode === "fresh";
+      var rActive = mini ? 3.2 : 4.2, rNorm = mini ? 2.4 : 3.4;
+      if (b.is_active) {
+        svgParts.push('<circle cx="' + x + '" cy="' + y + '" r="' + (mini ? 5.6 : 7.2) + '" fill="' + col + '" fill-opacity="0.24"/>');
+        svgParts.push('<circle cx="' + x + '" cy="' + y + '" r="' + rActive + '" fill="' + (isFresh ? "var(--panel)" : col) +
+          '" stroke="' + (isFresh ? col : "var(--panel)") + '" stroke-width="' + (isFresh ? 2 : 1.4) + '"/>');
+      } else {
+        svgParts.push('<circle cx="' + x + '" cy="' + y + '" r="' + rNorm + '" fill="var(--panel)" stroke="' + col +
+          '" stroke-width="' + (mini ? 1.6 : 2) + '"' + (isFresh ? ' stroke-dasharray="1.8 1.2"' : "") + '/>');
+      }
+      if (mini) {
+        var bw = Math.max(6, Math.round(28 * Math.sqrt((b.own_messages || 1) / maxMsgs)));
+        var bx = graphW;
+        svgParts.push('<rect x="' + bx + '" y="' + (y - 2) + '" width="' + bw + '" height="4" rx="2" fill="' + col +
+          '" fill-opacity="' + (b.is_active ? "0.9" : "0.35") + '"><title>' + MD.escape(b.name + " (" + b.kind + ", " + b.own_messages + "m)") + '</title></rect>');
+      }
+    });
+
+    return '<svg xmlns="http://www.w3.org/2000/svg" width="' + svgW + '" height="' + svgH +
+      '" viewBox="0 0 ' + svgW + ' ' + svgH + '">' + svgParts.join("") + "</svg>";
+  }
+
+  function renderMinimap() {
+    var c = cur;
+    if (!c || !c.minimapEl) return;
+    var info = c.branches;
+    var list = info && info.branches ? info.branches : [];
+    if (list.length <= 1) {
+      c.minimapEl.hidden = true;
+      c.minimapEl.textContent = "";
+      c.minimapEl.className = "branch-minimap";
+      return;
+    }
+    c.minimapEl.hidden = false;
+    c.minimapEl.textContent = "";
+    var tree = orderThreadsTree(list);
+    var ordered = tree.ordered, kids = tree.kids;
+    var colorMap = branchLaneMap(list);
+
+    // Mode A (default): Sublime Text-like translucent minimal strip; clicking opens the full graph sidebar
+    if (!c.minimapExpanded) {
+      c.minimapEl.className = "branch-minimap minimal";
+      c.minimapEl.tabIndex = 0;
+      c.minimapEl.setAttribute("role", "button");
+      c.minimapEl.title = "Thread minimap (" + list.length + " threads) — click to open the full graph sidebar";
+      c.minimapEl.onclick = function () { setMinimapExpanded(true); };
+      c.minimapEl.onkeydown = function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setMinimapExpanded(true); } };
+      var miniSvg = el("div", { class: "bm-svg", html: buildGraphSvg(ordered, kids, colorMap, { rowH: 18, padX: 8, laneW: 10, mini: true }) });
+      c.minimapEl.append(
+        el("div", { class: "bm-mini-head" }, el("span", { text: "⑂ " + list.length }), el("span", { text: "◂" })),
+        miniSvg);
+      return;
+    }
+
+    // Mode B (expanded): full right-hand graph sidebar
+    c.minimapEl.className = "branch-minimap expanded";
+    c.minimapEl.removeAttribute("tabindex");
+    c.minimapEl.removeAttribute("role");
+    c.minimapEl.title = "";
+    c.minimapEl.onclick = null;
+    c.minimapEl.onkeydown = null;
+
+    var svg = el("div", { class: "bm-svg", html: buildGraphSvg(ordered, kids, colorMap, { rowH: 40, padX: 12, laneW: 14, mini: false }) });
+    var rows = el("div", { class: "bm-rows" });
+    ordered.forEach(function (item) {
+      var b = item.b;
+      var href = threadHref(c.id, b.id);
+      var acts = el("div", { class: "bm-row-acts" },
+        el("a", { class: "bm-act", href: href, target: "_blank", rel: "noopener", title: "Open in a new tab", text: "↗",
+          onclick: function (e) { e.stopPropagation(); } }),
+        S.offline || b.is_main ? null : el("button", { class: "bm-act", type: "button", title: "Set as main thread", text: "★",
+          onclick: function (e) { e.preventDefault(); e.stopPropagation(); promoteBranch(b.id); } }),
+        S.offline ? null : el("button", { class: "bm-act", type: "button", title: "Rename thread", text: "✎",
+          onclick: function (e) { e.preventDefault(); e.stopPropagation(); renameBranch(b.id, b.name); } }),
+        S.offline ? null : el("button", { class: "bm-act del", type: "button", title: "Delete thread", text: "✕",
+          onclick: function (e) { e.preventDefault(); e.stopPropagation(); deleteBranch(b.id, b.name); } }));
+      var kindTag = b.is_main ? "main" : (b.kind === "subagent" ? ("sub·" + (b.context_mode || "fresh")) : b.kind);
+      var row = el("a", { class: "bm-row" + (b.is_active ? " active" : "") + (b.is_main ? " is-main" : "") +
+          (b.kind === "subagent" ? " is-subagent" : ""),
+        href: href, "data-branch-id": b.id,
+        title: b.name + " (" + b.id + ", " + b.kind + ", " + (b.context_mode || "fork") + " context)\n" +
+          b.own_messages + " message" + (b.own_messages === 1 ? "" : "s") +
+          (b.fork_preview ? "\nAt: " + b.fork_preview : "") },
+        el("div", { class: "bm-row-info" },
+          el("span", { class: "bm-row-title", text: b.name }),
+          el("span", { class: "bm-row-sub" },
+            el("span", { class: "btag", text: kindTag }),
+            el("span", { text: b.own_messages + "m" }),
+            b.status === "running" ? el("span", { class: "status-dot", title: "running" }) : null)),
+        acts);
+      rows.append(row);
+    });
+
+    c.minimapEl.append(
+      el("div", { class: "bm-head" },
+        el("span", { text: "⑂ Threads (" + list.length + ")" }),
+        el("span", { class: "spacer" }),
+        S.offline ? null : el("button", { class: "link-btn", type: "button", title: "Start a new aside from the current tip (/aside)",
+          text: "+ Aside", onclick: function () { startAsideFrom(null); } }),
+        el("button", { class: "icon-btn", type: "button", style: "width:22px;height:22px", title: "Minimize to compact minimap", text: "⇥",
+          onclick: function () { setMinimapExpanded(false); } })),
+      el("div", { class: "bm-body" }, el("div", { class: "bm-graph-wrap" }, svg, rows)));
+  }
+
+  function decorateBranchCard(card, b) {
+    var name = card._name.textContent;
+    var input = b.input || {};
+    if (name === "threads" || name === "branches") { card._sum.textContent = "list session threads & peers"; return; }
+    if (name === "spawn") {
+      var ctx = input.context || "fresh";
+      if (input.description) {
+        card._sum.textContent = "";
+        card._sum.append(el("span", { class: "badge", text: ctx }), " ", el("span", { class: "host", text: input.description }));
+      }
+      var tid = card._threadId;
+      if (b.content !== undefined) {
+        try { var parsed = JSON.parse(resultText(b)); tid = parsed.thread_id || parsed.branch_id || tid; } catch (e) { /* not json */ }
+      }
+      if (tid && cur && card._threadId !== tid) {
+        card._threadId = tid;
+        if (card._child) card._child.remove();
+        var th = cur.branches && cur.branches.branches ? cur.branches.branches.find(function (x) { return x.id === tid; }) : null;
+        card._child = el("span", { class: "sub-child" }, "→ ",
+          el("a", { class: "sub-link", href: threadHref(cur.id, tid), text: th ? th.name : tid }));
+        card._child.addEventListener("click", function (e) { e.stopPropagation(); });
+        card._stat.before(card._child);
+      }
+      return;
+    }
+    var targetId = typeof input.target_id === "string" ? input.target_id : (typeof input.branch_id === "string" ? input.branch_id : "");
+    var found = cur && cur.branches && cur.branches.branches ? cur.branches.branches.find(function (x) { return x.id === targetId; }) : null;
+    var peer = !found ? S.sessions.get(targetId) : null;
+    var label = found ? found.name : (peer ? titleOf(peer) : targetId);
+    var text = typeof input.question === "string" ? input.question : (typeof input.text === "string" ? input.text : (typeof input.prompt === "string" ? input.prompt : ""));
+    card._sum.textContent = "";
+    card._sum.append("⑂ ", el("span", { class: "host", text: label || "?" }),
+      text ? el("span", { class: "path", text: "  " + text.replace(/\s+/g, " ").slice(0, 120) }) : null);
   }
 
   // ---- peer sessions ---------------------------------------------------------------------------
@@ -1268,6 +1866,8 @@
       m.versions > 1 ? el("div", { class: "versions", title: "This message was edited; older versions are kept in the file", text: "edited · " + m.versions + " versions" }) : null,
       el("div", { class: "msg-actions" },
         el("button", { class: "link-btn", type: "button", text: "Copy", onclick: function () { copyText(text); toast("Copied"); } }),
+        S.offline ? null : el("button", { class: "link-btn", type: "button", text: "Aside", title: "Start a side-branch from this message",
+          onclick: function () { startAsideFrom(m.id); } }),
         S.offline || !providerReady() ? null : el("button", { class: "link-btn", type: "button", text: "Edit", title: "Edit and resend (↑ in an empty composer)",
           onclick: function () { startEdit(m.id); } })));
     return wrap;
@@ -1286,7 +1886,7 @@
       var t = ta.value;
       if (!t.trim()) return;
       ta.disabled = true;
-      rpcToast("chat.edit", { session_id: c.id, message_id: mid, text: t }).then(function () { c.stick = true; c.ta.focus(); },
+      rpcToast("chat.edit", { session_id: c.id, message_id: mid, text: t, branch_id: c.branchId || undefined }).then(function () { c.stick = true; c.ta.focus(); },
         function () { ta.disabled = false; });
     }
     ta.addEventListener("keydown", function (e) {
@@ -1309,7 +1909,7 @@
     if (!cur) return false;
     for (var i = cur.messages.length - 1; i >= 0; i--) {
       var m = cur.messages[i];
-      if (m.role === "user" && !isToolResultMsg(m) && !isSubResultMsg(m) && !isCompactionMsg(m) && !isPeerMsg(m)) { startEdit(m.id); return true; }
+      if (m.role === "user" && !isToolResultMsg(m) && !isSubResultMsg(m) && !isBranchResultMsg(m) && !isCompactionMsg(m) && !isPeerMsg(m)) { startEdit(m.id); return true; }
     }
     return false;
   }
@@ -1556,6 +2156,9 @@
       if (card._name.textContent === "subagent") decorateSubagentCard(card, { input: input });
       else if (card._name.textContent === "webfetch") decorateWebfetchCard(card, input || {});
       else if (card._name.textContent === "send_message") decorateSendCard(card, input || {});
+      else if (card._name.textContent === "spawn" || card._name.textContent === "ask" || card._name.textContent === "message" ||
+          card._name.textContent === "threads" || card._name.textContent === "branches" ||
+          card._name.textContent === "ask_branch" || card._name.textContent === "message_branch") decorateBranchCard(card, { input: input || {} });
     }
   }
   function decorateWebfetchCard(card, input) {
@@ -1583,6 +2186,7 @@
     card._result.className = "tool-result" + (err ? " err" : "");
     card._result.textContent = resultText(r);
     if (card._name.textContent === "subagent" && !err) decorateSubagentCard(card, r);
+    if (card._name.textContent === "spawn" && !err) decorateBranchCard(card, r);
     if (!err && /\n\n⚠ /.test(card._result.textContent)) {  // a peer-session conflict warning (edit/write)
       card._stat.className = "tstat warn";
       card._stat.textContent = "⚠";
@@ -1607,7 +2211,14 @@
       else if (b.type === "tool_use") wrap.append(toolCard(b));
     });
     var timing = messageTiming(m);
-    if (timing) wrap.append(el("div", { class: "msg-timing", title: "How long the text streamed · the whole response, from its request to its end", text: timing }));
+    var actions = el("div", { class: "msg-actions" },
+      S.offline ? null : el("button", { class: "link-btn", type: "button", text: "Aside", title: "Start a side-branch from this message",
+        onclick: function () { startAsideFrom(m.id); } }));
+    if (timing || !S.offline) {
+      wrap.append(el("div", { class: "msg-foot" },
+        timing ? el("div", { class: "msg-timing", title: "How long the text streamed · the whole response, from its request to its end", text: timing }) : null,
+        actions));
+    }
     enhanceCode(wrap);
     return wrap;
   }
@@ -1668,9 +2279,11 @@
       var e = c.draftEls[i];
       if (!e || e._type !== b.type) {
         var ne;
-        if (b.type === "thinking") ne = thinkingEl("", true);
-        if (b.type === "thinking" && b.started_at) liveTimer(ne._label, b.started_at, "Thinking… ");
-        else if (b.type === "tool_use") { ne = toolCard(b); }
+        // stay collapsed while the model reasons: the summary preview shows the text as it streams
+        if (b.type === "thinking") {
+          ne = thinkingEl("", false);
+          if (b.started_at) liveTimer(ne._label, b.started_at, "Thinking… ");
+        } else if (b.type === "tool_use") { ne = toolCard(b); }
         else ne = el("div", { class: "md" });
         ne._type = b.type;
         if (e) e.replaceWith(ne);
@@ -1706,6 +2319,8 @@
     (c.queue || []).forEach(function (t) {
       var sr = parseSubResult(t);
       if (sr) { c.queueEl.append(el("div", { class: "msg user queued" }, el("div", { class: "bubble", text: "Subagent result: " + (sr.description || sr.session_id) }), el("div", { class: "qlabel", text: "queued" }))); return; }
+      var br = parseBranchResult(t);
+      if (br) { c.queueEl.append(el("div", { class: "msg user queued" }, el("div", { class: "bubble", text: "Branch result: " + (br.title || br.branch_id) }), el("div", { class: "qlabel", text: "queued" }))); return; }
       c.queueEl.append(el("div", { class: "msg user queued" }, el("div", { class: "bubble", text: t }), el("div", { class: "qlabel", text: "queued" })));
     });
     afterContent();
@@ -1821,7 +2436,7 @@
     autoGrow(c.ta);
     S.composerDrafts.delete(c.id);
     c.stick = true;
-    rpc("chat.send", { session_id: c.id, text: text }).catch(function (e) {
+    rpc("chat.send", { session_id: c.id, text: text, branch_id: c.branchId || undefined }).catch(function (e) {
       toast("Send failed: " + e.message, "error");
       if (cur === c && !c.ta.value) { c.ta.value = text; autoGrow(c.ta); }
     });
@@ -1829,8 +2444,7 @@
 
   function stopRun() {
     if (!cur) return;
-    var s = S.sessions.get(cur.id);
-    if (s && s.status === "running") rpcToast("chat.stop", { session_id: cur.id }).catch(function () {});
+    if (curThreadRunning()) rpcToast("chat.stop", { session_id: cur.id, branch_id: cur.branchId || undefined }).catch(function () {});
   }
 
   // ---- new session view ------------------------------------------------------------------------
@@ -1975,6 +2589,7 @@
             el("span", { title: s.updated_at ? new Date(s.updated_at).toLocaleString() : "", text: ago(s.updated_at) }),
             el("span", { text: "· " + (s.message_count || 0) + " message" + (s.message_count === 1 ? "" : "s") }),
             kids ? el("span", { class: "kids-count", text: kids + " subagent" + (kids === 1 ? "" : "s") }) : null,
+            s.branch_count > 1 ? el("span", { class: "branch-count", text: "⑂" + s.branch_count + " branches" }) : null,
             s.kind === "subagent" ? el("span", { class: "badge", text: "subagent" }) : null,
             s.status === "running" ? el("span", { class: "badge running", text: "running" }) : null)),
         n && n.kids.length ? treeToggle(n) : null,

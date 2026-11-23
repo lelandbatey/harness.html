@@ -109,6 +109,21 @@ MIGRATIONS = [
     ALTER TABLE messages ADD COLUMN effort TEXT;
     ALTER TABLE messages ADD COLUMN started_at INT;
     """,
+    # 8: lightweight conversation branching (/aside): named branch tips inside a session
+    """
+    CREATE TABLE IF NOT EXISTS branches(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, name TEXT,
+                                        origin_id INTEGER, head_id INTEGER, kind TEXT,
+                                        created_at INT, updated_at INT);
+    CREATE INDEX IF NOT EXISTS branches_session ON branches(session_id, updated_at);
+    ALTER TABLE sessions ADD COLUMN active_branch_id TEXT;
+    """,
+    # 9: unified session threads (asides + subagents): explicit parent branch, UI anchor, fresh/fork context
+    """
+    ALTER TABLE branches ADD COLUMN parent_branch_id TEXT;
+    ALTER TABLE branches ADD COLUMN spawned_at_id INTEGER;
+    ALTER TABLE branches ADD COLUMN context_mode TEXT;
+    UPDATE branches SET spawned_at_id = origin_id, context_mode = 'fork' WHERE context_mode IS NULL;
+    """,
 ]
 
 

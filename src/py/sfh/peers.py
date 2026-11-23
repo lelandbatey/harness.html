@@ -464,6 +464,10 @@ class Hub:
         for p in [p for p, c in self.claims.items() if c["session_id"] == sid]:
             del self.claims[p]
 
+    def forget_thread(self, bid):
+        for p in [p for p, c in self.claims.items() if c.get("branch_id") == bid]:
+            del self.claims[p]
+
 
 class ToolBridge:
     """The peer tools' access to the hub from the tool thread (everything runs on the event loop)."""
