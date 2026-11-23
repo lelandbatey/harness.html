@@ -230,25 +230,27 @@ class Agent:
                                    "FROM sessions WHERE id=?", (sid,))
         if not row:
             return None
-        active_bid = branches.ensure(self.store, sid)
+        main_bid = branches.ensure(self.store, sid)
         b_rows = self.store.query("SELECT id, name, kind FROM branches WHERE session_id=?", (sid,))
         any_running = any(self.branch_running(r[0]) for r in b_rows)
-        active_running = self.branch_running(active_bid)
-        active_row = next((r for r in b_rows if r[0] == active_bid), None)
-        count = len(self.thread_ids(sid, active_bid))
+        main_running = self.branch_running(main_bid)
+        main_row = next((r for r in b_rows if r[0] == main_bid), None)
+        count = len(self.thread_ids(sid, main_bid))
         try:
             provider, model = self.session_llm(sid, glob=glob)
             pid, perr = provider["id"], None
         except llm.LLMError as e:
             pid, model, perr = row[7], row[6], str(e)
-        bname = (active_row[1] or ("Main" if active_row[2] == "main" else "New aside")) if active_row else "Main"
-        bkind = (active_row[2] or "main") if active_row else "main"
+        bkind = ("root" if main_row[2] == "main" else main_row[2] or "aside") if main_row else "root"
+        bname = (main_row[1] or branches.default_name(bkind, True)) if main_row else "Main"
         out = dict({"id": row[0], "title": row[1] or "", "cwd": row[2], "created_at": row[3], "updated_at": row[4],
                     "subjects": json.loads(row[5] or "[]"), "model": model, "provider": pid,
                     "model_override": row[6], "provider_override": row[7],
                     "status": "running" if any_running else "idle",
-                    "active_status": "running" if active_running else "idle",
-                    "active_branch_id": active_bid, "active_branch_name": bname, "active_branch_kind": bkind,
+                    # active_*: the session's default thread, which is the main thread (aliases of main_*)
+                    "active_status": "running" if main_running else "idle",
+                    "main_branch_id": main_bid, "main_branch_name": bname,
+                    "active_branch_id": main_bid, "active_branch_name": bname, "active_branch_kind": bkind,
                     "branch_count": len(b_rows),
                     "threads": branches.compact_threads(self, sid),
                     "message_count": count}, **subagents.info(self.store, sid))

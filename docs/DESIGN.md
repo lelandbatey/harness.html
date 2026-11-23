@@ -1116,3 +1116,64 @@ Owner's refinements on v16 (see [questions/035-branching-aside.md](../questions/
   - **Expanded**: full `260px` right-hand graph sidebar showing the whole tree + thread titles, kind/context
     tags, `↗` open-in-new-tab links, `★` promote, `✎` rename, `✕` delete, `+ Aside`, and `⇥` minimize back
     to the translucent minimap.
+
+## v18: main as a tag, spatial thread view, collapsed inherited history (questions/035, second round)
+
+README: the conversation UI shows a "spacial display" of connected branches (parent on the left, children on the
+right, small previews beside the fork message, adaptive to the free width, fast sideways animation); side branches
+use the same conventions as the sidebar tree/minimap (dashed = fresh subagent, solid = fork, same icons).
+
+### Main is a tag (migration 10)
+- `sessions.main_branch_id` is the tag; `branches.kind` no longer carries it. The session's first thread has
+  `kind = 'root'` (was `'main'`); kinds are `root | aside | subagent | edit`. Migration 10 moves the tag from the
+  `kind='main'` row into `sessions.main_branch_id` and re-kinds that row `root` (or `aside` when it was a promoted
+  aside, i.e. it has an `origin_id`/`parent_branch_id`). `sessions.active_branch_id` is no longer used.
+- `branches.promote` only moves the tag (no renames, no re-kinding); `maybe_auto_promote` keeps its rule (asides
+  only, ≥ 3 own prompts, deeper past the LCA than main). Deleting the main thread moves the tag to its parent
+  thread (else the root/oldest thread).
+- `branches.ensure` returns the main thread: it is the default thread for `sessions.subscribe` without `branch_id`,
+  `chat.send` from clients without a viewed thread, `/branch main`, `sessions.head_id` (kept in sync with main's
+  head) and therefore the session title / message count. Switching or creating threads is per tab only and no
+  longer touches the session row.
+- Unnamed threads display as `Main` (root while it holds the tag) / `Original` (root after the tag moved) /
+  `New aside` / `Subagent`. Thread lists are ordered by creation (root first), never "main first", so nothing
+  moves when the tag moves; lane colours are by creation order with the root in lane 0.
+- Session summary: `main_branch_id`; `active_branch_id/_name/_kind` and `active_status` are kept as aliases that
+  now describe the main thread.
+- Web: `★` marks main in the minimap, the sidebar tree and fork previews; the sidebar tree pins a duplicate
+  `★ <main title>` entry at the top of a branched session's thread list (the minimap does not duplicate it).
+
+### Collapsed inherited history (migration 10: `branches.expanded`)
+- `branches.expanded INT` (NULL/0 = collapsed) per thread; `branches.set_expanded {session_id, branch_id,
+  expanded}` stores it and emits `branches.updated`, so every tab viewing that thread follows live. Offline
+  copies toggle locally only.
+- Web: messages before the thread's fork message (`origin_id`) render inside a hidden `.inherited` block behind a
+  `.inherit-bar` ("⋯ N earlier messages from *Parent* · Show"); the fork message and the thread's own messages
+  follow. Expanding keeps the scroll position anchored on the bar. Root threads and fresh-context subagents have
+  nothing inherited.
+
+### Spatial view (web only)
+- `tree_info` adds per thread `preview: {prompt, reply}` (first own user prompt and the start of the first reply)
+  and `expanded`, and for the viewed thread a `parent_link {branch_id, name, kind, context_mode, at, preview}`
+  where `at` is the fork message id (or `"root"`); the parent's preview is its continuation after the fork point.
+  `forks{msg_id|"root": [chips]}` no longer contains the parent's group; chips carry `preview`, `created_at`, and
+  are ordered by `created_at`, then title. For a fresh-context thread, `"root"` chips are limited to its own
+  children.
+- `renderSpatial()` replaces the inline `.branch-fork` strips: an absolutely positioned `.spatial` layer inside
+  `.chat-inner` with one group per fork message (children, right gutter) and one parent group (left gutter, at the
+  fork boundary, or the top for fresh threads). Groups are laid out top-down (pushed below the previous group when
+  they would overlap) with an elbow connector from the conversation edge; dashed for fresh subagents.
+- Modes per side from the free gutter width ((scroll width − conversation width) / 2): `full` (≥ 220px: card with
+  icon, title, first prompt, and the reply when ≥ 300px), `title` (≥ 90px: low-contrast title text), `node`
+  (otherwise: a small dot on the conversation edge with a hover card). The left side needs 80px more for each mode,
+  so the parent degrades first. Recomputed on resize (ResizeObserver) and after content changes.
+- Up to 2 chips per fork message are shown stacked; `+N` expands the stack in place (per tab, not stored).
+- Clicking a preview navigates via the hash; `applyBranchSwitch` plays a ~140ms slide: from the right when going to
+  a child, from the left when going to the parent.
+
+### Tests
+`test/test_branches.py`: promotion moves only the tag (kinds/names unchanged, `head_id` follows main, default
+thread for new subscribers is main), deleting main moves the tag to the parent, `set_expanded` persists and is
+broadcast to other tabs, `parent_link`/`preview`/ordering in `tree_info`. `test/browser.mjs`: the v17 subagent step
+updated to threads (spawn card → thread link, `<thread-message>` card, sidebar thread tree), plus collapsed
+inherited history, spatial previews (modes by width), `+N`, and the pinned `★` main entry.

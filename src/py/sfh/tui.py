@@ -970,7 +970,7 @@ def render_transcript(items, draft, width, cache=None, live=None, running=False,
     out = []
     if forks.get("root"):
         out.append(_fork_line(forks["root"], width))
-    if active_b and not active_b.get("is_main") and active_b.get("origin_id") is None:
+    if active_b and active_b.get("kind") not in ("root", "main") and active_b.get("origin_id") is None:
         out.append(styled(clip("  ── ↳ %s: %s ──" % (active_b.get("kind", "aside"), active_b.get("name", "")), width),
                           DIM + CYAN))
     prev = None
@@ -997,7 +997,7 @@ def render_transcript(items, draft, width, cache=None, live=None, running=False,
             out.append(styled(clip("  ── turn took %s" % fmt_dur(ends[i]), width), DIM))
         if it[0] == "msg" and it[1].get("id") is not None:
             mid = it[1]["id"]
-            if active_b and not active_b.get("is_main") and active_b.get("origin_id") == mid:
+            if active_b and active_b.get("kind") not in ("root", "main") and active_b.get("origin_id") == mid:
                 out.append(styled(clip("  ── ↳ %s: %s ──" % (active_b.get("kind", "aside"), active_b.get("name", "")),
                                        width), DIM + CYAN))
             if forks.get(str(mid)):
@@ -1253,7 +1253,8 @@ class BranchPicker(SessionPicker):
         for i in range(self.top, min(len(m), self.top + avail)):
             b = m[i]
             title = tree_prefix(b.get("_depth", 0)) + (b.get("name") or "(unnamed)")
-            tags = [b.get("kind") or "aside", "%d msgs" % b.get("own_messages", 0)]
+            tags = [b.get("kind") or "aside"] + (["★ main"] if b.get("is_main") else []) + [
+                "%d msgs" % b.get("own_messages", 0)]
             if b.get("status") == "running":
                 tags.append("running")
             if b.get("is_active"):
@@ -1938,7 +1939,11 @@ class App:
         status = s.get("status", "")
         prov = ("%s:%s" % (s["provider"], s["model"]) if s.get("provider") and s.get("model")
                 else provider_label((self.hello or {}).get("provider")))
-        btag = (" · ⑂ %s (%d)" % (s.get("active_branch_name") or "Main", s.get("branch_count", 1))
+        viewed = next((b for b in ((getattr(self, "branches", None) or {}).get("branches") or [])
+                       if b.get("id") == getattr(self, "branch_id", None)), None)
+        bname = ((("★ " if viewed.get("is_main") else "") + (viewed.get("name") or "")) if viewed
+                 else s.get("active_branch_name") or "Main")
+        btag = (" · ⑂ %s (%d)" % (bname, s.get("branch_count", 1))
                 if (s.get("branch_count") or 1) > 1 else "")
         head = " %s%s · %s · %s · effort %s · %s " % (s.get("title") or "(untitled)", btag, s.get("id", ""),
                                                       prov or s.get("model", ""), effort_label(s), status)

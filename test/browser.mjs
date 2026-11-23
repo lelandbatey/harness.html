@@ -295,42 +295,104 @@ await waitFor(p1, () => document.querySelector(".msgs .compaction-wrap details.c
 await waitFor(p1, () => (document.querySelector(".chat-foot .session-ctx")?.textContent || "").startsWith("context ~"), "context estimated after /compact");
 step("context gauge; /compact shows a summary card");
 
-// 9b. subagent: tool card links to the child, the child nests under the parent, the result comes back as a card
+// 9b. subagent threads (v17): the spawn card links to the child thread, its <thread-message> report comes back
+// as a card, and the sidebar tree lists the thread under the session (below a pinned ★ main entry)
 await p1.bringToFront();
 await typeInto(p1, ".composer textarea", "[[subagent:child task here]]");
 await p1.keyboard.press("Enter");
-await waitFor(p1, () => document.querySelector('.msgs .tool .sub-link[data-child]') && /mock task/.test(document.querySelector(".msgs .tool .tsum")?.textContent || "") &&
-  [...document.querySelectorAll(".msgs .tool .tname")].some((e) => e.textContent === "subagent"), "subagent tool card with child link", 15000);
-const childId = await p1.$eval(".msgs .tool .sub-link[data-child]", (e) => e.getAttribute("data-child"));
-if (!childId || childId === sid) await fail("bad child id: " + childId);
-await waitFor(p1, (c) => {
-  const card = document.querySelector(".msgs .msg.subresult .subresult-card");
-  return card && /Subagent result/.test(card.textContent) && /mock task/.test(card.textContent) && /completed/.test(card.textContent) &&
-    /child task here/.test(card.querySelector(".md")?.textContent || "") && card.querySelector('a.sub-link[href="#session/' + encodeURIComponent(c) + '"]');
-}, "subagent result card", 20000, childId);
+await waitFor(p1, (s) => [...document.querySelectorAll(".msgs .tool")].some((t) => t.querySelector(".tname")?.textContent === "spawn" &&
+  /mock task/.test(t.querySelector(".tsum")?.textContent || "") && (t.querySelector("a.sub-link")?.getAttribute("href") || "").startsWith("#session/" + encodeURIComponent(s) + "/")),
+  "spawn tool card with a link to the child thread", 15000, sid);
+const rootBid = await p1.evaluate(() => window.SFHApp.current.branchId);
+const childBid = await p1.evaluate(() => decodeURIComponent([...document.querySelectorAll(".msgs .tool a.sub-link")].pop().getAttribute("href").split("/").pop()));
+if (!childBid || childBid === rootBid) await fail("bad child thread id: " + childBid);
+await waitFor(p1, (s, b) => {
+  const card = document.querySelector(".msgs .msg.subresult .branch-result-card");
+  return card && /Subagent report/.test(card.textContent) && /completed/.test(card.textContent) &&
+    /child task here/.test(card.querySelector(".md")?.textContent || "") && card.querySelector('a.branch-jump[href="#session/' + encodeURIComponent(s) + "/" + encodeURIComponent(b) + '"]');
+}, "subagent report card", 20000, sid, childBid);
 const srEdit = await p1.evaluate(() => [...document.querySelectorAll(".msgs .msg.subresult button")].some((b) => b.textContent === "Edit") ||
-  [...document.querySelectorAll(".msgs .msg.user .bubble")].some((b) => b.textContent.includes("<subagent-result")));
-if (srEdit) await fail("subagent result rendered as an editable user bubble");
-await waitFor(p1, () => [...document.querySelectorAll(".msgs .tool .sub-status")].some((b) => b.textContent === "idle"), "child live status in tool card", 15000);
-await waitFor(p1, (p, c) => {
-  const pli = document.querySelector('#sb-list a[data-sid="' + p + '"]')?.parentElement;
-  const cli = document.querySelector('#sb-list a[data-sid="' + c + '"]')?.parentElement;
-  return pli && cli && cli.classList.contains("child") && pli.querySelector(".kids-count")?.textContent === "1" && pli.nextElementSibling === cli;
-}, "child nested under parent in the sidebar", 8000, sid, childId);
-await waitFor(p1, () => !document.querySelector(".chat-head .badge.running"), "parent idle after the result turn", 15000);
-await p1.evaluate((p) => document.querySelector('#sb-list a[data-sid="' + p + '"]').parentElement.querySelector(".tree-tog").click(), sid);
-await waitFor(p1, (c) => !document.querySelector('#sb-list a[data-sid="' + c + '"]'), "collapse hides the child", 5000, childId);
-await p1.evaluate((p) => document.querySelector('#sb-list a[data-sid="' + p + '"]').parentElement.querySelector(".tree-tog").click(), sid);
-await waitFor(p1, (c) => document.querySelector('#sb-list a[data-sid="' + c + '"]'), "expand shows the child", 5000, childId);
-await p1.evaluate((c) => document.querySelector('.msgs a.sub-link[data-child="' + c + '"]').click(), childId);
-await waitFor(p1, (c, p) => location.hash === "#session/" + encodeURIComponent(c) && window.SFHApp.current && !window.SFHApp.current.loading &&
-  /subagent of/.test(document.querySelector(".chat-head .sub-of")?.textContent || "") &&
-  document.querySelector('.chat-head a.parent-link[href="#session/' + encodeURIComponent(p) + '"]'), "child session header links back", 8000, childId, sid);
-await p1.click(".chat-head a.parent-link");
-// (location.hash changes at once; the app routes on the hashchange event a moment later, so waits after a
-// navigation check SFHApp.current.id, not the hash: until then the old chat and its composer are still there)
-await waitFor(p1, (p) => location.hash === "#session/" + encodeURIComponent(p) && window.SFHApp.current?.id === p && !window.SFHApp.current.loading, "back at the parent", 8000, sid);
-step("subagent: tool card link + live status, result card, sidebar nesting, child header");
+  [...document.querySelectorAll(".msgs .msg.user .bubble")].some((b) => b.textContent.includes("<thread-message")));
+if (srEdit) await fail("subagent report rendered as an editable user bubble");
+await waitFor(p1, () => !document.querySelector(".chat-head .badge.running"), "parent idle after the report turn", 15000);
+await waitFor(p1, (s, b, r) => document.querySelector('#sb-list li.thread-item:not(.pinned-main) a[data-sid="' + s + '"][data-bid="' + b + '"]') &&
+  document.querySelector('#sb-list li.pinned-main a[data-sid="' + s + '"][data-bid="' + r + '"]'), "child thread + pinned main entry in the sidebar tree", 8000, sid, childBid, rootBid);
+await p1.evaluate((p) => document.querySelector('#sb-list a[data-sid="' + p + '"]:not([data-bid])').parentElement.querySelector(".tree-tog").click(), sid);
+await waitFor(p1, (s, b) => !document.querySelector('#sb-list a[data-sid="' + s + '"][data-bid="' + b + '"]'), "collapse hides the threads", 5000, sid, childBid);
+await p1.evaluate((p) => document.querySelector('#sb-list a[data-sid="' + p + '"]:not([data-bid])').parentElement.querySelector(".tree-tog").click(), sid);
+await waitFor(p1, (s, b) => document.querySelector('#sb-list a[data-sid="' + s + '"][data-bid="' + b + '"]'), "expand shows the threads", 5000, sid, childBid);
+step("subagent thread: spawn card link, report card, sidebar thread tree with pinned main");
+
+// 9b2. spatial view (v18): children on the right / the parent on the left, beside their fork message; the mode
+// follows the free width (full preview card, title, node with a hover card), the parent degrading first
+await p1.setViewport({ width: 1900, height: 900 });
+await waitFor(p1, (b) => {
+  const a = document.querySelector('.spatial .sv-group.sv-right a.sv-chip.sv-full[data-branch-id="' + b + '"]');
+  return a && /child task here/.test(a.querySelector(".sv-prompt")?.textContent || "") && a.classList.contains("is-fresh") && a.querySelector(".sv-reply");
+}, "wide: full preview card for the child", 8000, childBid);
+const geo = await p1.evaluate((b) => {
+  const a = document.querySelector('.spatial a[data-branch-id="' + b + '"]').getBoundingClientRect(), m = document.querySelector(".msgs").getBoundingClientRect();
+  return { cardLeft: a.left, msgsRight: m.right };
+}, childBid);
+if (geo.cardLeft < geo.msgsRight) await fail("child preview overlaps the conversation: " + JSON.stringify(geo));
+await p1.setViewport({ width: 1200, height: 850 });
+await waitFor(p1, (b) => document.querySelector('.spatial .sv-group.sv-right.mode-node a.sv-node[data-branch-id="' + b + '"] .sv-pop'), "narrow: a node with a hover card", 8000, childBid);
+await p1.setViewport({ width: 1900, height: 900 });
+await waitFor(p1, (b) => document.querySelector('.spatial a.sv-full[data-branch-id="' + b + '"]'), "wide again", 8000, childBid);
+await p1.evaluate((b) => document.querySelector('.spatial a.sv-chip[data-branch-id="' + b + '"]').click(), childBid);
+await waitFor(p1, (s, b, r) => location.hash === "#session/" + encodeURIComponent(s) + "/" + encodeURIComponent(b) && window.SFHApp.current.branchId === b &&
+  document.querySelector('.spatial .sv-group.sv-left a.sv-chip[data-branch-id="' + r + '"]') && document.querySelector(".chat-inner.sv-in-right"),
+  "child opened (slides in from the right) with the parent on the left", 8000, sid, childBid, rootBid);
+await p1.evaluate((r) => document.querySelector('.spatial .sv-left a.sv-chip[data-branch-id="' + r + '"]').click(), rootBid);
+await waitFor(p1, (r) => window.SFHApp.current.branchId === r && !window.SFHApp.current.loading && document.querySelector(".chat-inner.sv-in-left"),
+  "back at the parent (slides in from the left)", 8000, rootBid);
+// an aside: inherited history starts collapsed; expanding it is stored per thread; the parent link stays
+await typeInto(p1, ".composer textarea", "/aside detour question");
+await p1.keyboard.press("Enter");
+await waitFor(p1, (r) => {
+  const c = window.SFHApp.current;
+  return c.branchId !== r && !c.loading && c.messages.some((m) => m.role === "assistant" && JSON.stringify(m.content).includes("to: detour question")) &&
+    document.querySelector(".msgs > .inherited[hidden]") && /earlier message/.test(document.querySelector(".msgs > .inherit-bar")?.textContent || "");
+}, "aside with collapsed inherited history", 15000, rootBid);
+const asideBid = await p1.evaluate(() => window.SFHApp.current.branchId);
+await waitFor(p1, (r) => document.querySelector('.spatial .sv-left a.sv-chip[data-branch-id="' + r + '"]'), "aside: parent on the left", 8000, rootBid);
+await p1.click(".msgs > .inherit-bar");
+await waitFor(p1, (r) => document.querySelector(".msgs > .inherited:not([hidden]) .msg") && document.querySelector('.spatial .sv-left a.sv-chip[data-branch-id="' + r + '"]'),
+  "expanded inherited history keeps the parent link", 5000, rootBid);
+await waitFor(p1, async (s, b) => (await window.SFHApp.rpc("branches.list", { session_id: s })).branches.find((x) => x.id === b)?.expanded === true,
+  "expanded state stored on the thread", 5000, sid, asideBid);
+// ★ main is a tag: promoting moves the pinned entry and the star, nothing else; then move it back
+const threadKinds = (s) => p1.evaluate(async (i) => (await window.SFHApp.rpc("branches.list", { session_id: i })).branches.map((b) => b.id + ":" + b.kind).join(","), s);
+const kinds0 = await threadKinds(sid);
+await p1.evaluate(() => [...document.querySelectorAll(".branch-origin-div button")].find((b) => /Set as main/.test(b.textContent)).click());
+await waitFor(p1, (s, b) => document.querySelector('#sb-list li.pinned-main a[data-sid="' + s + '"][data-bid="' + b + '"]') &&
+  /★/.test(document.querySelector(".chat-head .branch-btn")?.textContent || ""), "promoted aside: pinned ★ entry + header star", 8000, sid, asideBid);
+const kinds1 = await threadKinds(sid);
+if (kinds1 !== kinds0 || !/:aside$/.test(kinds1)) await fail("promotion changed thread kinds/order: " + kinds0 + " -> " + kinds1);
+await p1.evaluate((s, r) => window.SFHApp.rpc("branches.promote", { session_id: s, branch_id: r }), sid, rootBid);
+await waitFor(p1, (s, r) => document.querySelector('#sb-list li.pinned-main a[data-sid="' + s + '"][data-bid="' + r + '"]'), "main tag back on the root", 8000, sid, rootBid);
+// more than 2 threads at one message: 2 stacked + "+N" expanding in place
+const forkAt = await p1.evaluate(() => { const c = window.SFHApp.current, a = c.branches.branches.find((b) => b.id === c.branchId); return a.origin_id; });
+await p1.evaluate(async (s, r, at) => {
+  for (const t of ["second detour", "third detour"])
+    await window.SFHApp.rpc("branches.create", { session_id: s, from_message_id: at, title: t, switch: false, parent_branch_id: r });
+}, sid, rootBid, forkAt);
+await p1.evaluate((r) => document.querySelector('.spatial .sv-left a.sv-chip[data-branch-id="' + r + '"]').click(), rootBid);
+await waitFor(p1, (r, at) => window.SFHApp.current.branchId === r && document.querySelectorAll('.spatial .sv-group[data-fork-at="' + at + '"] a.sv-chip').length === 2 &&
+  document.querySelector('.spatial .sv-group[data-fork-at="' + at + '"] .sv-more')?.textContent === "+1", "2 stacked + “+1”", 8000, rootBid, String(forkAt));
+const stackOrder = await p1.evaluate((at) => [...document.querySelectorAll('.spatial .sv-group[data-fork-at="' + at + '"] .sv-name')].map((e) => e.textContent).join("|"), String(forkAt));
+if (!/^[^|]+\|second detour$/.test(stackOrder)) await fail("stack not in creation order: " + stackOrder);
+await p1.evaluate((at) => document.querySelector('.spatial .sv-group[data-fork-at="' + at + '"] .sv-more').click(), String(forkAt));
+await waitFor(p1, (at) => document.querySelectorAll('.spatial .sv-group[data-fork-at="' + at + '"] a.sv-chip').length === 3, "“+1” expands the stack in place", 5000, String(forkAt));
+// mid width: the right side shows titles while the parent side (needs more room) already degrades to a node
+await p1.evaluate((b) => { location.hash = "#session/" + encodeURIComponent(window.SFHApp.current.id) + "/" + encodeURIComponent(b); }, asideBid);
+await waitFor(p1, (b) => window.SFHApp.current.branchId === b && !window.SFHApp.current.loading, "aside again", 8000, asideBid);
+await p1.setViewport({ width: 1400, height: 850 });
+await waitFor(p1, () => document.querySelector(".spatial .sv-group.sv-left.mode-node a.sv-node"), "mid width: the parent degrades to a node first", 8000);
+await p1.setViewport({ width: 1200, height: 850 });
+await p1.evaluate((r) => { location.hash = "#session/" + encodeURIComponent(window.SFHApp.current.id) + "/" + encodeURIComponent(r); }, rootBid);
+await waitFor(p1, (r) => window.SFHApp.current.branchId === r && !window.SFHApp.current.loading, "back on the root thread", 8000, rootBid);
+step("spatial view: modes by width, sideways navigation, collapsed history, ★ main tag, +N stack");
 
 // 9c. peer sessions: a second session in the same directory asks this one a question (held: it is the
 // user's idle session), the peer strip + inbox show it, "Let it answer" delivers it; a shared file is flagged
@@ -367,12 +429,9 @@ await p1.evaluate(() => { location.hash = "#sessions"; });
 await waitFor(p1, (id) => document.querySelector('.card[data-sid="' + id + '"] svg') && document.querySelector(".card .meta"), "sessions grid card", 5000, sid);
 const cardText = await p1.$eval(".card", (e) => e.textContent);
 if (!/message/.test(cardText)) await fail("card lacks message count: " + cardText);
-await waitFor(p1, (p, c) => {
-  const g = document.querySelector('.card-group > .card[data-sid="' + p + '"]')?.parentElement;
-  return g && g.querySelector('.card-kids .card.child[data-sid="' + c + '"]') && /1 subagent/.test(g.firstElementChild.textContent) &&
-    !document.querySelector('.grid > .card-group > .card[data-sid="' + c + '"]');
-}, "child card nested under its parent in the grid", 5000, sid, childId);
-step("sessions grid (with nested subagent)");
+const nThreads = await p1.evaluate(async (s) => (await window.SFHApp.rpc("branches.list", { session_id: s })).branches.length, sid);
+await waitFor(p1, (p, n) => (document.querySelector('.card[data-sid="' + p + '"]')?.textContent || "").includes("⑂" + n + " branches"), "thread count on the grid card", 5000, sid, nThreads);
+step("sessions grid (with the thread count)");
 
 // 11. settings round trip (visible on the other page via settings.updated)
 await p1.evaluate(() => { location.hash = "#settings"; });

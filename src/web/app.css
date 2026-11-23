@@ -188,8 +188,8 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent-soft
 .badge.running::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: pulse 1.2s infinite; }
 .badge.mock { background: var(--warn-soft); }
 
-.chat-scroll { flex: 1; overflow-y: auto; min-height: 0; position: relative; scroll-behavior: auto; }
-.chat-inner { max-width: 860px; margin: 0 auto; padding: 20px 24px 28px; }
+.chat-scroll { flex: 1; overflow-y: auto; overflow-x: hidden; min-height: 0; position: relative; scroll-behavior: auto; }
+.chat-inner { max-width: 860px; margin: 0 auto; padding: 20px 24px 28px; position: relative; }
 .msgs, .draft-host, .queue-host { display: flex; flex-direction: column; gap: 14px; }
 .draft-host:not(:empty), .queue-host:not(:empty) { margin-top: 14px; }
 .msg { min-width: 0; }
@@ -592,27 +592,75 @@ a.local-missing { color: inherit; text-decoration: line-through dotted; text-dec
 .branch-slide { animation: branchSlide .16s ease-out; }
 @keyframes branchSlide { from { opacity: .35; transform: translateX(12px); } to { opacity: 1; transform: translateX(0); } }
 
-/* inline fork/spawn strip below a message where threads diverge */
-.branch-fork { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 4px 10px; margin: -4px 0 2px; border-left: 2px solid var(--border-strong); background: var(--bg-soft); border-radius: 0 8px 8px 0; font-size: 12.5px; }
-.branch-fork-lbl { color: var(--muted); font-size: 11.5px; white-space: nowrap; display: inline-flex; align-items: center; gap: 4px; }
-.branch-chip { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--border-strong); background: var(--bg); color: var(--fg-soft); cursor: pointer; font-size: 12px; max-width: 34ch; min-width: 0; transition: border-color .1s, background .1s; text-decoration: none; }
-.branch-chip:hover { border-color: var(--accent); color: var(--fg); background: var(--accent-soft); }
-.branch-chip.is-fresh { border-style: dashed; }
-.branch-chip .bdot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--lane-color, var(--accent)); }
-.branch-chip.is-fresh .bdot { background: transparent; border: 1.8px solid var(--lane-color, var(--accent)); }
-.branch-chip .bname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
-.branch-chip .bmeta { color: var(--muted); font-size: 11px; flex: none; }
-.branch-chip .btag { font-size: 10px; padding: 0 5px; border-radius: 999px; background: var(--bg-sunk); color: var(--muted); flex: none; }
-.branch-chip.is-main .btag { background: var(--accent-soft); color: var(--accent); }
-.branch-fork .branch-add { border: 1px dashed var(--border-strong); background: transparent; color: var(--muted); border-radius: 999px; padding: 1px 7px; font-size: 11.5px; cursor: pointer; }
-.branch-fork .branch-add:hover { border-color: var(--accent); color: var(--accent); }
-
-/* divider showing where the currently viewed thread diverged or spawned */
+/* divider after a thread's fork message */
 .branch-origin-div { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin: 2px 0; }
 .branch-origin-div::before, .branch-origin-div::after { content: ""; flex: 1; border-top: 1px dashed var(--accent); opacity: .45; min-width: 16px; }
 .branch-origin-div strong { color: var(--fg-soft); font-weight: 600; }
 .branch-origin-div .bact { font-size: 11.5px; padding: 0 6px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg); color: var(--fg-soft); cursor: pointer; text-decoration: none; }
 .branch-origin-div .bact:hover { border-color: var(--accent); color: var(--accent); }
+
+/* collapsed inherited history (v18): the messages before a thread's fork message */
+.inherited { display: flex; flex-direction: column; gap: 14px; }
+.inherited[hidden] { display: none; }
+.inherit-bar { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 12px; border: 1px dashed var(--border-strong); border-radius: 9px; background: var(--bg-soft); color: var(--muted); font: inherit; font-size: 12.5px; cursor: pointer; text-align: left; }
+.inherit-bar:hover { border-color: var(--accent); color: var(--fg-soft); }
+.inherit-bar em { font-style: normal; font-weight: 600; color: var(--fg-soft); }
+.inherit-bar .ib-dots { font-weight: 700; color: var(--accent); }
+.inherit-bar .ib-act { margin-left: auto; color: var(--accent); font-size: 12px; }
+.bm-star, .sb-list .th-star { color: #d4a017; }
+.sb-list .th-star { font-size: 10px; flex: none; }
+.sb-list li.pinned-main > a { color: var(--fg-soft); }
+.sb-list li.pinned-main .th-ico { color: #d4a017; }
+
+/* spatial view (v18): parent thread on the left, child threads on the right of the conversation, beside their
+   fork message. Not columns: floating previews in the free space, degrading to titles, then to dots. */
+.spatial { position: absolute; left: 0; top: 0; width: 100%; height: 0; z-index: 3; pointer-events: none; }
+.spatial[hidden] { display: none; }
+.sv-group { position: absolute; display: flex; flex-direction: column; gap: 4px; pointer-events: auto; }
+.sv-group.sv-left { align-items: flex-end; }
+.sv-chip { display: block; text-decoration: none; color: var(--fg-soft); min-width: 0; max-width: 100%; }
+.sv-head { display: flex; align-items: center; gap: 5px; min-width: 0; font-size: 12px; }
+.sv-ico { flex: none; color: var(--lane-color, var(--accent)); font-size: 11px; }
+.sv-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; min-width: 0; }
+.sv-nested { flex: none; font-size: 10.5px; color: var(--muted); }
+.sv-head .status-dot { flex: none; }
+.sv-prompt, .sv-reply { display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; font-size: 12px; line-height: 1.35; }
+.sv-prompt { -webkit-line-clamp: 3; margin-top: 3px; color: var(--fg-soft); }
+.sv-reply { -webkit-line-clamp: 3; margin-top: 4px; padding-top: 4px; border-top: 1px dashed var(--border); color: var(--muted); }
+.sv-chip.sv-full { width: 100%; box-sizing: border-box; padding: 6px 9px; border: 1px solid var(--border); border-left: 3px solid var(--lane-color, var(--accent)); border-radius: 9px; background: var(--panel); opacity: .8; transition: opacity .12s, box-shadow .12s, transform .12s; }
+.sv-left .sv-chip.sv-full { border-left-width: 1px; border-right: 3px solid var(--lane-color, var(--accent)); }
+.sv-chip.sv-full:hover, .sv-chip.sv-full:focus-visible { opacity: 1; box-shadow: var(--shadow); outline: none; }
+.sv-right .sv-chip.sv-full:hover { transform: translateX(-2px); }
+.sv-left .sv-chip.sv-full:hover { transform: translateX(2px); }
+.sv-chip.sv-full.is-fresh { border-style: dashed; border-left-style: solid; }
+.sv-left .sv-chip.sv-full.is-fresh { border-left-style: dashed; border-right-style: solid; }
+.sv-chip.sv-title { padding: 1px 4px; color: var(--muted); opacity: .55; border-radius: 6px; transition: opacity .12s; }
+.sv-chip.sv-title .sv-name { font-weight: 500; }
+.sv-chip.sv-title:hover, .sv-chip.sv-title:focus-visible { opacity: 1; color: var(--fg); background: var(--bg-soft); outline: none; }
+.sv-group.mode-node { width: 12px; gap: 3px; }
+.sv-chip.sv-node { position: relative; width: 12px; height: 12px; display: flex; align-items: center; justify-content: center; }
+.sv-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--lane-color, var(--accent)); opacity: .75; box-shadow: 0 0 0 2px var(--bg); }
+.sv-node.is-fresh .sv-dot { background: var(--bg); border: 1.6px dashed var(--lane-color, var(--accent)); width: 7px; height: 7px; }
+.sv-chip.sv-node:hover .sv-dot, .sv-chip.sv-node:focus-visible .sv-dot { opacity: 1; transform: scale(1.25); }
+.sv-pop { display: none; position: absolute; top: -6px; width: 260px; padding: 6px 9px; border: 1px solid var(--border); border-left: 3px solid var(--lane-color, var(--accent)); border-radius: 9px; background: var(--panel); box-shadow: var(--shadow); z-index: 20; color: var(--fg-soft); }
+.sv-right .sv-pop { right: 18px; }
+.sv-left .sv-pop { left: 18px; }
+.sv-chip.sv-node:hover .sv-pop, .sv-chip.sv-node:focus-visible .sv-pop { display: block; }
+.sv-more { align-self: flex-start; border: 1px dashed var(--border-strong); background: var(--bg); color: var(--muted); border-radius: 999px; padding: 0 7px; font-size: 11px; line-height: 16px; cursor: pointer; }
+.sv-left .sv-more { align-self: flex-end; }
+.mode-node .sv-more { padding: 0 3px; font-size: 9.5px; line-height: 12px; margin-left: -4px; }
+.sv-more:hover { border-color: var(--accent); color: var(--accent); }
+.sv-elbow { position: absolute; border-top: 1.5px solid var(--lane-color, var(--accent)); opacity: .5; pointer-events: none; box-sizing: border-box; }
+.sv-elbow.sv-right { border-right: 1.5px solid var(--lane-color, var(--accent)); border-top-right-radius: 8px; }
+.sv-elbow.sv-left { border-left: 1.5px solid var(--lane-color, var(--accent)); border-top-left-radius: 8px; }
+.sv-elbow.is-fresh { border-style: dashed; }
+.sv-out-left { transition: transform .09s ease-in, opacity .09s ease-in; transform: translateX(-36px); opacity: .35; }
+.sv-out-right { transition: transform .09s ease-in, opacity .09s ease-in; transform: translateX(36px); opacity: .35; }
+.sv-in-right { animation: svInRight .14s ease-out; }
+.sv-in-left { animation: svInLeft .14s ease-out; }
+@keyframes svInRight { from { opacity: .3; transform: translateX(48px); } to { opacity: 1; transform: translateX(0); } }
+@keyframes svInLeft { from { opacity: .3; transform: translateX(-48px); } to { opacity: 1; transform: translateX(0); } }
+@media (prefers-reduced-motion: reduce) { .sv-in-right, .sv-in-left { animation: none; } .sv-out-left, .sv-out-right { transform: none; } }
 
 /* two-mode right-hand minimap:
    1. minimal (default): Sublime Text-like translucent floating strip; click expands full graph sidebar

@@ -361,6 +361,7 @@
         if (!forCur(d)) break;
         cur.branches = d.branches || cur.branches;
         if (cur.branches && cur.branches.active_branch_id) cur.branchId = cur.branches.active_branch_id;
+        syncInherited(cur);
         renderForkMarks();
         renderMinimap();
         updateHeader();
@@ -606,7 +607,7 @@
   }
 
   function threadGlyph(t) {
-    if (t.is_main || t.kind === "main") return "●";
+    if (t.kind === "root" || t.kind === "main") return "●";
     if (t.kind === "subagent") return t.context_mode === "fresh" ? "◌" : "⑂";
     if (t.kind === "edit") return "↺";
     return "⑂";
@@ -644,19 +645,25 @@
       if (!treeCollapsed(s.id)) {
         if (threads.length > 1) {
           var cmap = branchLaneMap(threads);
-          orderThreadsTree(threads).ordered.forEach(function (item) {
-            var t = item.b;
+          var threadLink = function (t, d, pinned) {
             var isCur = s.id === activeId && activeBid === t.id;
             var col = laneColor(cmap.get(t.id) || 0);
             var href = "#session/" + encodeURIComponent(s.id) + "/" + encodeURIComponent(t.id);
-            var tip = t.name + " (" + t.kind + (t.kind === "subagent" ? " · " + (t.context_mode || "fresh") : "") + ")";
-            var ta = el("a", { href: href, class: isCur ? "active" : null, title: tip, "data-sid": s.id, "data-bid": t.id },
-              el("span", { class: "th-ico", style: "--lane-color:" + col, text: threadGlyph(t) }),
+            var tip = (pinned ? "Main thread: " : "") + t.name + " (" + t.kind + (t.kind === "subagent" ? " · " + (t.context_mode || "fresh") : "") +
+              (t.is_main ? ", ★ main" : "") + ")";
+            // the pinned duplicate is never marked current, so the tree shows where you are
+            var ta = el("a", { href: href, class: isCur && !pinned ? "active" : null, title: tip, "data-sid": s.id, "data-bid": t.id,
+                "data-pinned-main": pinned ? "1" : null },
+              el("span", { class: "th-ico", style: "--lane-color:" + col, text: pinned ? "★" : threadGlyph(t) }),
               el("span", { class: "t", text: t.name }),
+              t.is_main && !pinned ? el("span", { class: "th-star", title: "main thread", text: "★" }) : null,
               t.kind === "subagent" ? el("span", { class: "th-tag", text: t.context_mode === "fresh" ? "sub" : "fork" }) : null,
               t.status === "running" ? el("span", { class: "status-dot", title: "running" }) : null);
-            ul.append(el("li", { class: "thread-item", style: "--depth:" + (depth + 1 + Math.min(3, item.depth)) }, ta));
-          });
+            ul.append(el("li", { class: "thread-item" + (pinned ? " pinned-main" : ""), style: "--depth:" + d }, ta));
+          };
+          var mainT = threads.find(function (t) { return t.is_main; });
+          if (mainT) threadLink(mainT, depth + 1, true);
+          orderThreadsTree(threads).ordered.forEach(function (item) { threadLink(item.b, depth + 1 + Math.min(3, item.depth), false); });
         }
         n.kids.forEach(function (k) { add(k, depth + 1); });
       }
@@ -755,6 +762,7 @@
     else S.composerDrafts.set(cur.id, cur.ta.value);
     var id = cur.id;
     if (cur.raf) cancelAnimationFrame(cur.raf);
+    if (cur.svObserver) cur.svObserver.disconnect();
     cur = null;
     $("#btw-box").hidden = true;
     $("#btw-box").textContent = "";
@@ -825,7 +833,7 @@
     var offBd = S.offline && S.offlineData && S.offlineData.branches ? S.offlineData.branches[id] : null;
     var sub;
     if (S.offline) {
-      var offBid = bid && offBd && offBd.threads && offBd.threads[bid] ? bid : (offBd && offBd.info ? offBd.info.active_branch_id : null);
+      var offBid = bid && offBd && offBd.threads && offBd.threads[bid] ? bid : (offBd && offBd.info ? (offBd.info.main_branch_id || offBd.info.active_branch_id) : null);
       var offMsgs = offBd && offBid && offBd.threads[offBid]
         ? offBd.threads[offBid].map(function (mid) { return offBd.messages[String(mid)]; }).filter(Boolean)
         : (((S.offlineData && S.offlineData.messages) || {})[id] || []);
@@ -866,11 +874,13 @@
   function loadBranchInTab(bid, animate) {
     var c = cur;
     if (!c) return;
+    // no thread in the URL: the main thread (the session's default), not whatever this tab showed last
+    if (!bid && c.branches && c.branches.main_branch_id) bid = c.branches.main_branch_id;
     if (bid && bid === c.branchId) return;
     if (S.offline) {
       var bd = c.offlineBranches;
       if (!bd || !bd.threads) return;
-      var target = bid && bd.threads[bid] ? bid : bd.info.active_branch_id;
+      var target = bid && bd.threads[bid] ? bid : (bd.info.main_branch_id || bd.info.active_branch_id);
       if (!target || !bd.threads[target]) return;
       var msgs = bd.threads[target].map(function (id) { return bd.messages[String(id)]; }).filter(Boolean);
       var info = recomputeOfflineBranches(bd, target);
@@ -1121,7 +1131,15 @@
     c.msgsEl.textContent = "";
     c.toolCards.clear();
     c.ctx = null;
-    c.messages.forEach(appendMessage);
+    c.inheritWrap = c.inheritBar = null;
+    // messages before the thread's fork message are inherited: they go into a block that starts collapsed
+    var act = activeThread(c);
+    var forkIdx = act && act.kind !== "root" && act.origin_id != null
+      ? c.messages.findIndex(function (m) { return m.id === act.origin_id; }) : -1;
+    c.messages.forEach(function (m, i) {
+      if (i === forkIdx && i > 0) wrapInherited(c, act, c.messages.slice(0, i));
+      appendMessage(m);
+    });
     if (!c.messages.length && !c.draft) {
       var s = S.sessions.get(c.id) || { id: c.id };
       c.msgsEl.append(el("div", { class: "empty-chat" }, svgEl(iconSvg(s, 64)),
@@ -1132,6 +1150,59 @@
     renderForkMarks();
     c.stick = true;
     afterContent();
+  }
+
+  function activeThread(c) {
+    c = c || cur;
+    if (!c || !c.branches || !c.branches.branches) return null;
+    return c.branches.branches.find(function (b) { return b.id === c.branchId; }) || null;
+  }
+
+  // Moves everything rendered so far into the collapsible inherited block, followed by its toggle bar.
+  function wrapInherited(c, act, inherited) {
+    var wrap = el("div", { class: "inherited" });
+    while (c.msgsEl.firstChild) wrap.append(c.msgsEl.firstChild);
+    var n = inherited.filter(function (m) { return !isToolResultMsg(m); }).length;
+    var parentB = c.branches.branches.find(function (b) { return b.id === act.parent_branch_id; });
+    var bar = el("button", { class: "inherit-bar", type: "button", "data-count": String(n),
+      onclick: function () { toggleInherited(); } });
+    bar._label = n + " earlier message" + (n === 1 ? "" : "s") + (parentB ? " from " : "");
+    bar._parent = parentB ? parentB.name : "";
+    c.msgsEl.append(wrap, bar);
+    c.inheritWrap = wrap;
+    c.inheritBar = bar;
+    syncInherited(c);
+  }
+  function syncInherited(c) {
+    if (!c || !c.inheritWrap) return;
+    var act = activeThread(c);
+    var open = !!(act && act.expanded);
+    c.inheritWrap.hidden = !open;
+    c.inheritWrap.classList.toggle("open", open);
+    var bar = c.inheritBar;
+    bar.textContent = "";
+    bar.setAttribute("aria-expanded", open ? "true" : "false");
+    bar.title = open ? "Collapse the inherited history" : "Show the inherited history (keeps scrolling up)";
+    append(bar, [el("span", { class: "ib-dots", text: open ? "▴" : "⋯" }),
+      el("span", null, (open ? "Hide " : "") + bar._label, bar._parent ? el("em", { text: bar._parent }) : null),
+      el("span", { class: "ib-act", text: open ? "Collapse" : "Show" })]);
+  }
+  function toggleInherited() {
+    var c = cur, act = activeThread(c);
+    if (!c || !act || !c.inheritBar) return;
+    var next = !act.expanded;
+    // keep the bar where it is on screen while the history above it appears / disappears
+    var before = c.inheritBar.getBoundingClientRect().top;
+    act.expanded = next;
+    if (S.offline && c.offlineBranches) {
+      c.offlineBranches.localExpanded = c.offlineBranches.localExpanded || {};
+      c.offlineBranches.localExpanded[act.id] = next;
+    }
+    syncInherited(c);
+    c.stick = false;
+    c.scroll.scrollTop += c.inheritBar.getBoundingClientRect().top - before;
+    scheduleSpatial();
+    if (!S.offline) rpc("branches.set_expanded", { session_id: c.id, branch_id: act.id, expanded: next }).catch(function () {});
   }
 
   // a divider where the model/provider or the working directory changes between messages
@@ -1216,9 +1287,9 @@
     if (!cur || !cur.branches || !cur.branches.branches || cur.branches.branches.length <= 1) return null;
     var list = cur.branches.branches;
     var active = list.find(function (b) { return b.id === cur.branchId; }) || list[0];
-    var isAside = active && !active.is_main && active.kind !== "subagent";
+    var isAside = active && active.kind !== "root" && active.kind !== "subagent";
     var isSub = active && active.kind === "subagent";
-    var lbl = threadGlyph(active) + " " + (active ? active.name : "Main") + " · " + list.length;
+    var lbl = threadGlyph(active) + " " + (active && active.is_main ? "★ " : "") + (active ? active.name : "Main") + " · " + list.length;
     return el("button", { class: "badge branch-btn" + (isAside ? " is-aside" : "") + (isSub ? " is-subagent" : ""),
       type: "button",
       title: (active ? active.name + " (" + active.kind + (isSub ? ", " + (active.context_mode || "fresh") + " context" : "") + ")" : "") +
@@ -1238,8 +1309,9 @@
     var map = new Map();
     if (!branchesList) return map;
     var nextLane = 1;
+    // by creation order with the root in lane 0, so colours never change when the main tag moves
     branchesList.forEach(function (b) {
-      if (b.is_main || b.kind === "main") map.set(b.id, 0);
+      if (b.kind === "root" || b.kind === "main") map.set(b.id, 0);
       else map.set(b.id, nextLane++);
     });
     return map;
@@ -1255,6 +1327,7 @@
     c.draft = snap.draft || null;
     c.queue = snap.queue || [];
     c.tools = snap.tools || {};
+    c.svStackOpen = {};
     if (snap.now) c.skew = snap.now - Date.now();
     // Keep URL hash synced with this tab's viewed thread without adding redundant history entries
     if (c.branchId) {
@@ -1270,10 +1343,15 @@
     updateHeader();
     updateComposer();
     renderSidebar();
-    if (animate && c.inner) {
-      c.inner.classList.remove("branch-slide");
-      void c.inner.offsetWidth;
-      c.inner.classList.add("branch-slide");
+    if (c.inner) {
+      // spatial navigation: the clicked thread slides in from its side (children right, parent left)
+      var dir = c.slideDir;
+      c.slideDir = null;
+      c.inner.classList.remove("branch-slide", "sv-in-right", "sv-in-left", "sv-out-left", "sv-out-right");
+      if (animate || dir) {
+        void c.inner.offsetWidth;
+        c.inner.classList.add(dir === "right" ? "sv-in-right" : dir === "left" ? "sv-in-left" : "branch-slide");
+      }
     }
   }
 
@@ -1285,6 +1363,14 @@
   }
 
   function recomputeOfflineBranches(bd, activeBid) {
+    if (bd.views && bd.views[activeBid]) {
+      // precomputed by the server (forks, parent link and previews relative to each thread); keep local toggles
+      var v = bd.views[activeBid];
+      var local = bd.localExpanded || {};
+      return Object.assign({}, v, { branches: v.branches.map(function (b) {
+        return local.hasOwnProperty(b.id) ? Object.assign({}, b, { expanded: local[b.id] }) : b;
+      }) });
+    }
     var activePath = bd.threads[activeBid] || [];
     var activeSet = new Set(activePath);
     var branches = bd.info.branches.map(function (b) { return Object.assign({}, b, { is_active: b.id === activeBid }); });
@@ -1383,68 +1469,184 @@
   function renderForkMarks() {
     var c = cur;
     if (!c || !c.msgsEl) return;
-    c.msgsEl.querySelectorAll(".branch-fork, .branch-origin-div").forEach(function (e) { e.remove(); });
-    if (!c.branches || !c.branches.branches || c.branches.branches.length <= 1) return;
+    c.msgsEl.querySelectorAll(".branch-origin-div").forEach(function (e) { e.remove(); });
+    if (!c.branches || !c.branches.branches || c.branches.branches.length <= 1) { scheduleSpatial(); return; }
     var info = c.branches;
-    var lanes = branchLaneMap(info.branches);
-    var active = info.branches.find(function (b) { return b.id === c.branchId; });
+    var active = activeThread(c);
 
-    // 1. Active thread origin banner/divider
-    if (active && !active.is_main) {
+    // Active thread origin divider (after its fork message)
+    if (active && active.kind !== "root") {
       var parentB = active.parent_branch_id ? info.branches.find(function (b) { return b.id === active.parent_branch_id; }) : null;
       var kindLbl = active.kind === "subagent" ? ("subagent · " + (active.context_mode || "fresh") + " context")
         : active.kind === "edit" ? "version" : "aside";
       var div = el("div", { class: "branch-origin-div", "data-branch-origin": active.id },
-        el("span", null, (active.context_mode === "fresh" ? "◌ " : "↳ ") + kindLbl + ": ", el("strong", { text: active.name })),
+        el("span", null, (active.context_mode === "fresh" ? "◌ " : "↳ ") + kindLbl + ": ",
+          active.is_main ? el("span", { class: "bm-star", title: "main thread", text: "★ " }) : null, el("strong", { text: active.name })),
         parentB ? el("a", { class: "bact", href: threadHref(c.id, parentB.id), title: "Back to " + parentB.name,
-          text: "← " + parentB.name }) : null,
-        S.offline ? null : el("button", { class: "bact", type: "button", title: "Make this the main thread", text: "Set as main",
+          text: "← " + parentB.name, onclick: function () { c.slideDir = "left"; } }) : null,
+        S.offline || active.is_main ? null : el("button", { class: "bact", type: "button", title: "Make this the main thread (★)", text: "★ Set as main",
           onclick: function () { promoteBranch(active.id); } }),
         S.offline ? null : el("button", { class: "bact", type: "button", title: "Rename this thread", text: "Rename",
           onclick: function () { renameBranch(active.id, active.name); } }));
-      if (active.origin_id != null) {
-        var anchor = findMsgAnchor(c, active.origin_id);
-        if (anchor) anchor.after(div);
-        else c.msgsEl.prepend(div);
-      } else {
-        c.msgsEl.prepend(div);
-      }
+      var anchor = active.origin_id != null ? findMsgAnchor(c, active.origin_id) : null;
+      if (anchor && anchor.parentNode === c.msgsEl) anchor.after(div);
+      else c.msgsEl.prepend(div);
     }
+    scheduleSpatial();
+  }
 
-    // 2. Inline fork/spawn strips along the displayed thread
+  // ---- spatial view: parent thread on the left, child threads on the right (v18) -------------------
+  // An absolutely positioned layer inside .chat-inner; groups sit beside their fork message and scroll with it.
+  // Each side picks a mode from its free width: "full" cards, "title" text, or a "node" dot (hover for a card).
+
+  var SV_FULL = 220, SV_REPLY = 300, SV_TITLE = 90, SV_LEFT_EXTRA = 80, SV_STACK = 2;
+  function svMode(gutter, left) {
+    var g = gutter - (left ? SV_LEFT_EXTRA : 0);
+    return g >= SV_FULL ? "full" : g >= SV_TITLE ? "title" : "node";
+  }
+  function scheduleSpatial() {
+    var c = cur;
+    if (!c || c.svRaf) return;
+    c.svRaf = requestAnimationFrame(function () { c.svRaf = 0; if (cur === c) renderSpatial(); });
+  }
+  function ensureSpatialObserver(c) {
+    if (c.svObserver || typeof ResizeObserver === "undefined") return;
+    var lastW = -1, lastH = -1;
+    c.svObserver = new ResizeObserver(function () {
+      if (cur !== c) { c.svObserver.disconnect(); return; }
+      var w = c.scroll.clientWidth, h = c.msgsEl.offsetHeight;
+      if (w === lastW && h === lastH) return;
+      lastW = w; lastH = h;
+      scheduleSpatial();
+    });
+    c.svObserver.observe(c.scroll);
+    c.svObserver.observe(c.msgsEl);
+  }
+  function svOpen(c, bid, side) {
+    c.slideDir = side;
+    var inner = c.inner;
+    if (inner) {
+      inner.classList.add(side === "left" ? "sv-out-right" : "sv-out-left");
+      // if the switch never lands (offline thread missing, rpc error), don't leave the conversation shifted
+      setTimeout(function () { inner.classList.remove("sv-out-left", "sv-out-right"); }, 1500);
+    }
+    switchBranch(bid);
+  }
+  function svPreviewBody(ch, withReply) {
+    var p = ch.preview || {};
+    return [p.prompt ? el("div", { class: "sv-prompt", text: p.prompt }) : el("div", { class: "sv-prompt muted", text: "(no messages yet)" }),
+      withReply && p.reply ? el("div", { class: "sv-reply", text: p.reply }) : null];
+  }
+  function svChipEl(c, ch, side, mode, col, gutter) {
+    var isFresh = ch.context_mode === "fresh";
+    var tip = (side === "left" ? "Parent thread: " : "") + ch.name + " (" + ch.kind +
+      (ch.kind === "subagent" ? ", " + (ch.context_mode || "fresh") + " context" : "") + (ch.is_main ? ", ★ main" : "") +
+      ", " + ch.own_messages + " message" + (ch.own_messages === 1 ? "" : "s") +
+      (ch.nested ? ", +" + ch.nested + " more thread" + (ch.nested === 1 ? "" : "s") + " from here" : "") + ")";
+    var head = el("div", { class: "sv-head" },
+      el("span", { class: "sv-ico", text: side === "left" ? "←" : threadGlyph(ch) }),
+      ch.is_main ? el("span", { class: "bm-star", title: "main thread", text: "★" }) : null,
+      el("span", { class: "sv-name", text: ch.name }),
+      ch.nested ? el("span", { class: "sv-nested", text: "+" + ch.nested }) : null,
+      ch.status === "running" ? el("span", { class: "status-dot", title: "running" }) : null);
+    var cls = "sv-chip sv-" + mode + (isFresh ? " is-fresh" : "") + (ch.is_main ? " is-main" : "");
+    var a = el("a", { class: cls, href: threadHref(c.id, ch.branch_id), "data-branch-id": ch.branch_id, style: "--lane-color:" + col,
+      title: mode === "full" ? tip + "\nClick to switch this tab · middle-click to open in a new tab" : tip,
+      onclick: function (e) {
+        if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey) return;
+        e.preventDefault();
+        svOpen(c, ch.branch_id, side);
+      } });
+    if (mode === "full") append(a, [head].concat(svPreviewBody(ch, gutter >= SV_REPLY + (side === "left" ? SV_LEFT_EXTRA : 0))));
+    else if (mode === "title") append(a, [head]);
+    else append(a, [el("span", { class: "sv-dot" }), el("span", { class: "sv-pop" }, [head].concat(svPreviewBody(ch, true)))]);
+    return a;
+  }
+  function renderSpatial() {
+    var c = cur;
+    if (!c || !c.inner) return;
+    var layer = c.svLayer;
+    if (!layer) {
+      layer = c.svLayer = el("div", { class: "spatial", "aria-label": "Connected threads" });
+      c.inner.prepend(layer);
+    }
+    layer.textContent = "";
+    var info = c.branches;
+    if (!info || !info.branches || info.branches.length <= 1) { layer.hidden = true; return; }
+    ensureSpatialObserver(c);
+    layer.hidden = false;
+    var lanes = branchLaneMap(info.branches);
+    var innerRect = c.inner.getBoundingClientRect();
+    var innerW = c.inner.offsetWidth;
+    var gutter = Math.max(0, (c.scroll.clientWidth - innerW) / 2);
+    var padR = parseFloat(getComputedStyle(c.inner).paddingRight) || 0;
+    var padL = parseFloat(getComputedStyle(c.inner).paddingLeft) || 0;
+    var modes = { left: svMode(gutter, true), right: svMode(gutter, false) };
+    var spOpen = c.svStackOpen || (c.svStackOpen = {});
+
+    function anchorY(key) {
+      if (key === "root") {
+        var first = c.msgsEl.firstElementChild;
+        return first ? first.getBoundingClientRect().top - innerRect.top + 6 : 24;
+      }
+      var a = findMsgAnchor(c, Number(key));
+      if (!a || !a.offsetParent) return null;  // inside the collapsed inherited history
+      var r = a.getBoundingClientRect();
+      return r.bottom - innerRect.top - 6;
+    }
+    var groups = [];
     var forks = info.forks || {};
     Object.keys(forks).forEach(function (key) {
       var chips = forks[key];
       if (!chips || !chips.length) return;
-      var total = chips.reduce(function (acc, ch) { return acc + 1 + (ch.nested || 0); }, 0);
-      var strip = el("div", { class: "branch-fork", "data-fork-at": key },
-        el("span", { class: "branch-fork-lbl", text: "⑂ " + total + " thread" + (total === 1 ? "" : "s") }));
-      chips.forEach(function (ch) {
-        var col = laneColor(lanes.get(ch.branch_id) || 1);
-        var isFresh = ch.context_mode === "fresh";
-        var btn = el("a", { class: "branch-chip" + (ch.is_main ? " is-main" : "") + (isFresh ? " is-fresh" : ""),
-          href: threadHref(c.id, ch.branch_id), style: "--lane-color:" + col, "data-branch-id": ch.branch_id,
-          title: ch.name + " (" + ch.kind + (ch.kind === "subagent" ? ", " + (ch.context_mode || "fresh") + " context" : "") +
-            ", " + ch.own_messages + " message" + (ch.own_messages === 1 ? "" : "s") +
-            (ch.nested ? ", +" + ch.nested + " sub-thread" + (ch.nested === 1 ? "" : "s") : "") +
-            ")\nClick to switch this tab · middle-click to open in a new tab" },
-          el("span", { class: "bdot" }),
-          el("span", { class: "bname", text: ch.name }),
-          ch.is_main ? el("span", { class: "btag", text: "main" }) : (ch.kind === "subagent" ? el("span", { class: "btag", text: isFresh ? "sub·fresh" : "sub·fork" }) : null),
-          ch.status === "running" ? el("span", { class: "status-dot", title: "running" }) : null,
-          el("span", { class: "bmeta", text: ch.own_messages + "m" + (ch.nested ? " +" + ch.nested : "") }));
-        strip.append(btn);
-      });
-      if (!S.offline && key !== "root") {
-        strip.append(el("button", { class: "branch-add", type: "button", title: "Start another aside from this message",
-          text: "+ Aside", onclick: function () { startAsideFrom(Number(key)); } }));
+      var y = anchorY(key);
+      if (y == null) return;
+      groups.push({ side: "right", key: key, chips: chips, y: y });
+    });
+    var pl = info.parent_link;
+    if (pl) {
+      var py = anchorY(pl.at);
+      if (py == null && pl.at !== "root" && c.inheritBar) py = c.inheritBar.getBoundingClientRect().bottom - innerRect.top;
+      if (py != null) groups.push({ side: "left", key: "parent", chips: [pl], y: py });
+    }
+    var bottoms = { left: -Infinity, right: -Infinity };
+    groups.sort(function (a, b) { return a.y - b.y; });
+    groups.forEach(function (g) {
+      var side = g.side, mode = modes[side], left = side === "left";
+      var open = !!spOpen[g.key];
+      var shown = open ? g.chips : g.chips.slice(0, SV_STACK);
+      var more = g.chips.length - shown.length;
+      var col = laneColor(lanes.get(g.chips[0].branch_id) || 0);
+      var box = el("div", { class: "sv-group sv-" + side + " mode-" + mode + (open ? " open" : ""), "data-fork-at": g.key });
+      shown.forEach(function (ch) { box.append(svChipEl(c, ch, side, mode, laneColor(lanes.get(ch.branch_id) || 0), gutter)); });
+      if (more > 0 || (open && g.chips.length > SV_STACK)) {
+        box.append(el("button", { class: "sv-more", type: "button",
+          title: open ? "Show fewer" : "Show " + more + " more thread" + (more === 1 ? "" : "s") + " from this message",
+          text: open ? "−" : "+" + more,
+          onclick: function (e) { e.preventDefault(); e.stopPropagation(); spOpen[g.key] = !open; renderSpatial(); } }));
       }
-      if (key === "root") {
-        c.msgsEl.prepend(strip);
-      } else {
-        var anchor = findMsgAnchor(c, Number(key));
-        if (anchor) anchor.after(strip);
+      layer.append(box);
+      var edgeX, cardX, w;
+      if (mode === "node") {
+        // a dot on the conversation's edge (inside its padding); the card pops up on hover
+        box.style.top = (g.y - 6) + "px";
+        if (left) box.style.left = Math.max(2, padL / 2 - 6) + "px"; else box.style.left = (innerW - Math.max(2, padR / 2 - 6) - 12) + "px";
+        return;
       }
+      w = Math.min(mode === "full" ? 320 : 220, gutter - (left ? SV_LEFT_EXTRA : 0) - 28);
+      if (left) { cardX = -w - 14 - (gutter > w + 40 ? 6 : 0); edgeX = padL - 4; }
+      else { cardX = innerW + 14; edgeX = innerW - padR + 4; }
+      box.style.width = w + "px";
+      box.style.left = cardX + "px";
+      var top = Math.max(g.y - 12, bottoms[side] + 8);
+      box.style.top = top + "px";
+      bottoms[side] = top + box.offsetHeight;
+      // elbow from the conversation edge to the group (dashed for fresh-context subagents)
+      var head = top + 12;
+      var x0 = left ? cardX + w : edgeX, x1 = left ? edgeX : cardX;
+      var elbow = el("div", { class: "sv-elbow sv-" + side + (g.chips[0].context_mode === "fresh" ? " is-fresh" : ""),
+        style: "--lane-color:" + col + ";top:" + g.y + "px;left:" + Math.min(x0, x1) + "px;width:" + Math.abs(x1 - x0) + "px;height:" + Math.max(0, head - g.y) + "px" });
+      layer.insertBefore(elbow, box);
     });
   }
 
@@ -1454,7 +1656,7 @@
     var rowOf = new Map(), laneOf = new Map(), maxLane = 0;
     ordered.forEach(function (item, idx) {
       rowOf.set(item.b.id, idx);
-      var lane = item.b.is_main ? 0 : Math.min(4, Math.max(1, item.depth));
+      var lane = Math.min(4, item.depth);
       laneOf.set(item.b.id, lane);
       if (lane > maxLane) maxLane = lane;
     });
@@ -1522,6 +1724,10 @@
         svgParts.push('<circle cx="' + x + '" cy="' + y + '" r="' + rNorm + '" fill="var(--panel)" stroke="' + col +
           '" stroke-width="' + (mini ? 1.6 : 2) + '"' + (isFresh ? ' stroke-dasharray="1.8 1.2"' : "") + '/>');
       }
+      if (b.is_main) {
+        svgParts.push('<text x="' + (x + (mini ? 4 : 6)) + '" y="' + (y - (mini ? 3 : 5)) + '" font-size="' + (mini ? 7 : 9) +
+          '" fill="#d4a017" class="bm-main-star">★</text>');
+      }
       if (mini) {
         var bw = Math.max(6, Math.round(28 * Math.sqrt((b.own_messages || 1) / maxMsgs)));
         var bx = graphW;
@@ -1588,7 +1794,7 @@
           onclick: function (e) { e.preventDefault(); e.stopPropagation(); renameBranch(b.id, b.name); } }),
         S.offline ? null : el("button", { class: "bm-act del", type: "button", title: "Delete thread", text: "✕",
           onclick: function (e) { e.preventDefault(); e.stopPropagation(); deleteBranch(b.id, b.name); } }));
-      var kindTag = b.is_main ? "main" : (b.kind === "subagent" ? ("sub·" + (b.context_mode || "fresh")) : b.kind);
+      var kindTag = b.kind === "subagent" ? ("sub·" + (b.context_mode || "fresh")) : b.kind;
       var row = el("a", { class: "bm-row" + (b.is_active ? " active" : "") + (b.is_main ? " is-main" : "") +
           (b.kind === "subagent" ? " is-subagent" : ""),
         href: href, "data-branch-id": b.id,
@@ -1596,7 +1802,7 @@
           b.own_messages + " message" + (b.own_messages === 1 ? "" : "s") +
           (b.fork_preview ? "\nAt: " + b.fork_preview : "") },
         el("div", { class: "bm-row-info" },
-          el("span", { class: "bm-row-title", text: b.name }),
+          el("span", { class: "bm-row-title" }, b.is_main ? el("span", { class: "bm-star", title: "main thread", text: "★ " }) : null, b.name),
           el("span", { class: "bm-row-sub" },
             el("span", { class: "btag", text: kindTag }),
             el("span", { text: b.own_messages + "m" }),

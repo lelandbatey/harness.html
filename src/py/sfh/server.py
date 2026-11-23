@@ -270,7 +270,12 @@ class Server:
             return list_dir(p.get("path"), bool(p.get("hidden")), a.default_cwd())
         if method == "sessions.subscribe":
             sid = p["session_id"]
-            bid = branches.resolve(self.store, sid, p["branch_id"]) if p.get("branch_id") else branches.active_id(self.store, sid)
+            # no branch_id: the thread this connection already views (re-subscribe), else the main thread
+            known = client.branch_of.get(sid)
+            if known and not branches.get_row(self.store, sid, known):
+                known = None
+            bid = (branches.resolve(self.store, sid, p["branch_id"]) if p.get("branch_id")
+                   else known or branches.main_id(self.store, sid))
             snap = a.snapshot(sid, branch_id=bid)
             client.subs.add(sid)
             client.branch_of[sid] = bid
@@ -344,6 +349,8 @@ class Server:
             return branches.rename(a, p["session_id"], p["branch_id"], p.get("title") or "")
         if method == "branches.promote":
             return branches.promote(a, p["session_id"], p["branch_id"])
+        if method == "branches.set_expanded":
+            return branches.set_expanded(a, p["session_id"], p["branch_id"], bool(p.get("expanded")))
         if method == "branches.delete":
             return await branches.delete(a, p["session_id"], p["branch_id"])
         if method == "settings.get":

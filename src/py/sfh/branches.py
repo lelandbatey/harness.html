@@ -3,7 +3,8 @@ living in one tree inside a session, with unified inter-thread communication (th
 ask, message) that also spans external peer sessions in the same repository.
 
 Each row in `branches` represents a thread of `session_id`:
-- `kind`: 'main' | 'aside' | 'subagent' | 'edit'
+- `kind`: 'root' (the session's first thread) | 'aside' | 'subagent' | 'edit'
+- the main thread is a tag: `sessions.main_branch_id` (moved by `promote`, never by switching)
 - `context_mode`: 'fork' (inherits messages up to `origin_id`) | 'fresh' (`origin_id` is NULL; clean context)
 - `origin_id`: message id where LLM history forks from (NULL for main or fresh-context subagent)
 - `spawned_at_id`: message id where this thread attaches visually in the UI/minimap
@@ -21,7 +22,7 @@ from .store import now_ms
 PROMOTE_PROMPTS = 3  # user prompts on an aside before it auto-promotes past an older main
 
 BRANCH_COLS = ("id, session_id, name, origin_id, head_id, kind, created_at, updated_at, "
-               "parent_branch_id, spawned_at_id, context_mode")
+               "parent_branch_id, spawned_at_id, context_mode, expanded")
 
 BRANCH_TITLE_RULES = (
     "Reply with ONLY a short branch title (at most 6 words, no quotes, no trailing period), "
@@ -91,34 +92,31 @@ def path_ids(store, sid, head_id, parents=None):
 
 
 def ensure(store, sid):
-    """Ensures `sid` has at least a `main` branch and a valid `sessions.active_branch_id`.
-    Returns the session's default active branch id (or None if the session does not exist)."""
+    """Ensures `sid` has at least a `root` thread and a valid main tag (`sessions.main_branch_id`).
+    Returns the main thread id: the session's default thread (or None if the session does not exist)."""
     with store.lock:
-        srow = store.query_one("SELECT head_id, active_branch_id, created_at, updated_at FROM sessions WHERE id=?",
+        srow = store.query_one("SELECT head_id, main_branch_id, created_at, updated_at FROM sessions WHERE id=?",
                                (sid,))
         if not srow:
             return None
-        s_head, active_bid, created_at, updated_at = srow
-        rows = store.query("SELECT id, kind FROM branches WHERE session_id=?", (sid,))
-        by_id = {r[0]: r for r in rows}
+        s_head, main_bid, created_at, updated_at = srow
+        rows = store.query("SELECT id, kind, head_id FROM branches WHERE session_id=? ORDER BY created_at, id", (sid,))
         if not rows:
             t = created_at or now_ms()
             bid = _new_id()
             store.execute(
                 "INSERT INTO branches(id, session_id, name, origin_id, head_id, kind, created_at, updated_at, "
                 "parent_branch_id, spawned_at_id, context_mode) "
-                "VALUES(?, ?, 'Main', NULL, ?, 'main', ?, ?, NULL, NULL, 'fork')",
+                "VALUES(?, ?, NULL, NULL, ?, 'root', ?, ?, NULL, NULL, 'fork')",
                 (bid, sid, s_head, t, updated_at or t))
-            store.execute("UPDATE sessions SET active_branch_id=? WHERE id=?", (bid, sid))
+            store.execute("UPDATE sessions SET main_branch_id=? WHERE id=?", (bid, sid))
             _discover_orphans(store, sid, bid, s_head, t)
             return bid
-        if active_bid not in by_id:
-            main = next((r[0] for r in rows if r[1] == "main"), rows[0][0])
-            store.execute("UPDATE sessions SET active_branch_id=? WHERE id=?", (main, sid))
-            active_bid = main
-        if not any(r[1] == "main" for r in rows):
-            store.execute("UPDATE branches SET kind='main' WHERE id=?", (active_bid,))
-        return active_bid
+        if not any(r[0] == main_bid for r in rows):
+            main = next((r for r in rows if r[1] == "root"), rows[0])
+            store.execute("UPDATE sessions SET main_branch_id=?, head_id=? WHERE id=?", (main[0], main[2], sid))
+            main_bid = main[0]
+        return main_bid
 
 
 def _discover_orphans(store, sid, main_bid, main_head, fallback_t):
@@ -156,16 +154,12 @@ def _discover_orphans(store, sid, main_bid, main_head, fallback_t):
 
 
 def active_id(store, sid):
+    """The session's default thread (the main thread); tabs track their own viewed thread."""
     return ensure(store, sid)
 
 
 def main_id(store, sid):
-    ensure(store, sid)
-    row = store.query_one("SELECT id FROM branches WHERE session_id=? AND kind='main' LIMIT 1", (sid,))
-    if row:
-        return row[0]
-    row = store.query_one("SELECT id FROM branches WHERE session_id=? ORDER BY created_at LIMIT 1", (sid,))
-    return row[0] if row else None
+    return ensure(store, sid)
 
 
 def get_row(store, sid, bid):
@@ -196,9 +190,7 @@ def resolve(store, sid, ref):
         raise ValueError("branch id or name is required")
     rows = store.query("SELECT id, name, kind FROM branches WHERE session_id=? ORDER BY created_at", (sid,))
     if ref.lower() == "main":
-        m = next((r[0] for r in rows if r[2] == "main"), None)
-        if m:
-            return m
+        return main_id(store, sid)
     exact = [r[0] for r in rows if r[0] == ref]
     if exact:
         return exact[0]
@@ -253,13 +245,13 @@ def resolve_global(agent, sid, ref):
 
 
 def set_head(store, sid, bid, head_id):
-    """Updates branch head_id (and sessions.head_id if bid is the session's default active branch)."""
+    """Updates branch head_id (and sessions.head_id if bid is the main thread)."""
     t = now_ms()
     with store.lock:
         store.execute("UPDATE branches SET head_id=?, updated_at=? WHERE session_id=? AND id=?",
                       (head_id, t, sid, bid))
-        active = store.query_one("SELECT active_branch_id FROM sessions WHERE id=?", (sid,))
-        if active and active[0] == bid:
+        main = store.query_one("SELECT main_branch_id FROM sessions WHERE id=?", (sid,))
+        if main and main[0] == bid:
             store.execute("UPDATE sessions SET head_id=?, updated_at=? WHERE id=?", (head_id, t, sid))
         else:
             store.execute("UPDATE sessions SET updated_at=? WHERE id=?", (t, sid))
@@ -294,8 +286,8 @@ def create(agent, sid, from_message_id=None, title="", kind="aside", switch=True
     """Creates a new thread inside `sid`.
     - context_mode='fork': inherits messages up to `origin_id` (`from_message_id` or parent branch's head)
     - context_mode='fresh': starts with clean context (`origin_id=None`), visually attached at `spawned_at_id`
-    When `switch=True` and `client` is given, only that client switches (per-tab views); `sessions.active_branch_id`
-    also updates as the default for new tabs/offline view.
+    When `switch=True` and `client` is given, only that client switches (per-tab views; the session's default thread
+    stays the main thread). Without a client, every subscribed tab switches.
     """
     agent.require(sid)
     store = agent.store
@@ -326,13 +318,9 @@ def create(agent, sid, from_message_id=None, title="", kind="aside", switch=True
             "parent_branch_id, spawned_at_id, context_mode) "
             "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (bid, sid, name, origin_id, origin_id, kind, t, t, cur_bid, attach_id, context_mode))
-        if switch:
-            store.execute("UPDATE sessions SET active_branch_id=?, head_id=?, updated_at=? WHERE id=?",
-                          (bid, origin_id, t, sid))
-            if client is not None:
-                client.branch_of[sid] = bid
-        else:
-            store.execute("UPDATE sessions SET updated_at=? WHERE id=?", (t, sid))
+        store.execute("UPDATE sessions SET updated_at=? WHERE id=?", (t, sid))
+        if switch and client is not None:
+            client.branch_of[sid] = bid
     if switch:
         emit_switched(agent, sid, bid, client=client)
     emit_updated(agent, sid)
@@ -342,21 +330,18 @@ def create(agent, sid, from_message_id=None, title="", kind="aside", switch=True
 
 
 def switch(agent, sid, branch_ref, client=None):
-    """Switches the requesting client's viewed thread (per-tab!). Also updates sessions.active_branch_id
-    as the default for newly opened tabs and offline snapshots. Returns snapshot for `bid`."""
+    """Switches the requesting client's viewed thread (per-tab; the session's default thread stays the main
+    thread). Without a client, every subscribed tab switches. Returns the snapshot for `bid`."""
     agent.require(sid)
     store = agent.store
     with store.lock:
         bid = resolve(store, sid, branch_ref)
-        row = get_row(store, sid, bid)
-        if not row:
+        if not get_row(store, sid, bid):
             raise ValueError("no such branch: %s" % branch_ref)
-        store.execute("UPDATE sessions SET active_branch_id=?, head_id=? WHERE id=?", (bid, row[4], sid))
         if client is not None:
             client.branch_of[sid] = bid
     emit_switched(agent, sid, bid, client=client)
     emit_updated(agent, sid)
-    agent.updated(sid)
     return agent.snapshot(sid, branch_id=bid)
 
 
@@ -376,7 +361,8 @@ def rename(agent, sid, branch_ref, title):
 
 
 def promote(agent, sid, branch_ref, auto=False):
-    """Makes `branch_ref` the new `main` branch; demotes the previous main to `aside`."""
+    """Moves the main tag (`sessions.main_branch_id`) to `branch_ref`. Like a git tag: no thread is renamed,
+    re-kinded or moved; the main thread is the session's default thread and the source of its title."""
     agent.require(sid)
     store = agent.store
     with store.lock:
@@ -384,34 +370,24 @@ def promote(agent, sid, branch_ref, auto=False):
         row = get_row(store, sid, bid)
         if not row:
             raise ValueError("no such branch: %s" % branch_ref)
-        if row[5] == "main":
+        if main_id(store, sid) == bid:
             return next(b for b in tree_info(agent, sid)["branches"] if b["id"] == bid)
-        old_main = store.query_one(
-            "SELECT id, name, head_id FROM branches WHERE session_id=? AND kind='main'", (sid,))
-        t = now_ms()
-        if old_main:
-            om_id, om_name, om_head = old_main
-            new_old_name = om_name
-            if not om_name or om_name.lower() == "main":
-                new_old_name = "Previous main"
-            store.execute("UPDATE branches SET kind='aside', name=?, updated_at=? WHERE id=?",
-                          (new_old_name, t, om_id))
-        store.execute("UPDATE branches SET kind='main', updated_at=? WHERE id=?", (t, bid))
+        store.execute("UPDATE sessions SET main_branch_id=?, head_id=?, updated_at=? WHERE id=?",
+                      (bid, row[4], now_ms(), sid))
+    b = next(x for x in tree_info(agent, sid)["branches"] if x["id"] == bid)
     if auto:
-        bname = row[2] or bid
         agent.server.emit(sid, "notice", {
             "session_id": sid, "branch_id": bid, "level": "info",
-            "text": "Branch **%s** is now the main conversation (the previous main branch is kept as an aside)."
-                    % bname})
+            "text": "Thread **%s** is now the main thread (★). The previous main thread is unchanged." % b["name"]})
     emit_updated(agent, sid)
     agent.updated(sid)
-    return next(b for b in tree_info(agent, sid)["branches"] if b["id"] == bid)
+    return b
 
 
 def maybe_auto_promote(agent, sid, bid):
     """If the user keeps chatting on an aside (>= PROMOTE_PROMPTS user prompts after origin, and
-    strictly deeper past the fork point than the current main), promote it to be the new main.
-    Subagent threads never auto-promote."""
+    strictly deeper past the fork point than the current main), move the main tag to it.
+    Only asides auto-promote (never root, subagent or edit threads)."""
     store = agent.store
     row = get_row(store, sid, bid)
     if not row or row[5] != "aside":
@@ -458,18 +434,20 @@ async def delete(agent, sid, branch_ref):
     if len(rows) <= 1:
         raise ValueError("cannot delete the only branch of a session")
     await agent.stop_branch(sid, bid)
-    was_active = active_id(store, sid) == bid
-    was_main = any(r[0] == bid and r[1] == "main" for r in rows)
+    was_main = main_id(store, sid) == bid
     with store.lock:
+        drow = get_row(store, sid, bid)
         store.execute("DELETE FROM branches WHERE session_id=? AND id=?", (sid, bid))
-        remaining = store.query("SELECT id, head_id, kind FROM branches WHERE session_id=? ORDER BY created_at",
+        remaining = store.query("SELECT id, head_id, kind FROM branches WHERE session_id=? ORDER BY created_at, id",
                                 (sid,))
-        fallback = next((r for r in remaining if r[2] == "main"), remaining[0])
+        by_id = {r[0]: r for r in remaining}
+        # the deleted thread's parent (else the root, else the oldest thread) takes over as fallback / main
+        fallback = by_id.get(drow[8] if drow else None) or next((r for r in remaining if r[2] == "root"), remaining[0])
         if was_main:
-            store.execute("UPDATE branches SET kind='main' WHERE id=?", (fallback[0],))
-        if was_active:
-            store.execute("UPDATE sessions SET active_branch_id=?, head_id=? WHERE id=?",
+            store.execute("UPDATE sessions SET main_branch_id=?, head_id=? WHERE id=?",
                           (fallback[0], fallback[1], sid))
+        else:
+            fallback = by_id.get(drow[8] if drow else None) or by_id[main_id(store, sid)]
         parents = _all_parents(store, sid)
         keep = set()
         for r in store.query("SELECT origin_id, head_id, spawned_at_id FROM branches WHERE session_id=?", (sid,)):
@@ -506,11 +484,11 @@ def compact_threads(agent, sid):
     brows = store.query(
         "SELECT id, name, origin_id, head_id, kind, created_at, updated_at, "
         "parent_branch_id, spawned_at_id, context_mode "
-        "FROM branches WHERE session_id=? ORDER BY CASE WHEN kind='main' THEN 0 ELSE 1 END, created_at, id",
+        "FROM branches WHERE session_id=? ORDER BY created_at, id",
         (sid,))
     if len(brows) <= 1:
         r = brows[0]
-        return [{"id": r[0], "name": r[1] or "Main", "kind": r[4] or "main",
+        return [{"id": r[0], "name": r[1] or "Main", "kind": r[4] or "root",
                  "context_mode": r[9] or "fork", "parent_branch_id": None,
                  "status": "running" if agent.branch_running(r[0]) else "idle",
                  "is_main": True}]
@@ -521,47 +499,82 @@ def compact_threads(agent, sid):
             for b in info["branches"]]
 
 
+def default_name(kind, is_main):
+    if kind in ("root", "main"):
+        return "Main" if is_main else "Original"
+    return "Subagent" if kind == "subagent" else ("Previous version" if kind == "edit" else "New aside")
+
+
+def _clip(text, n):
+    t = " ".join(str(text or "").split())
+    return t if len(t) <= n else t[:n - 1].rstrip() + "…"
+
+
+def _preview(path_ids_, msg_meta, start=0):
+    """{prompt, reply}: the first user prompt at/after `start` on a path and the start of the reply to it."""
+    prompt = reply = ""
+    for mid in path_ids_[start:]:
+        meta = msg_meta.get(mid)
+        if not meta:
+            continue
+        role, content = meta[0], meta[2]
+        if not prompt:
+            if _is_user_prompt(role, content):
+                prompt = _clip(_prompt_text(content), 280)
+            continue
+        if role == "assistant":
+            t = " ".join(b.get("text", "") for b in content if b.get("type") == "text").strip()
+            if t:
+                reply = _clip(t, 320)
+                break
+        elif _is_user_prompt(role, content):
+            break
+    return {"prompt": prompt, "reply": reply}
+
+
 def tree_info(agent, sid, active_bid=None):
-    """Full thread tree & inline fork/spawn points relative to `active_bid` (per-tab!)."""
+    """Full thread tree & fork/spawn points relative to `active_bid` (the thread a tab views).
+    - branches: every thread (creation order, root first); `is_main` marks the main tag
+    - forks: {msg_id | "root": [chips]} threads diverging from the viewed line (shown on the right)
+    - parent_link: the viewed thread's parent thread at its fork point (shown on the left)"""
     store = agent.store
-    default_bid = ensure(store, sid)
-    if not default_bid:
-        return {"active_branch_id": None, "main_branch_id": None, "branches": [], "forks": {}}
+    main_bid = ensure(store, sid)
+    if not main_bid:
+        return {"active_branch_id": None, "main_branch_id": None, "branches": [], "forks": {}, "parent_link": None}
     with store.lock:
-        brows = store.query(
-            "SELECT %s FROM branches WHERE session_id=? "
-            "ORDER BY CASE WHEN kind='main' THEN 0 ELSE 1 END, created_at, id" % BRANCH_COLS,
-            (sid,))
+        brows = store.query("SELECT %s FROM branches WHERE session_id=? ORDER BY created_at, id" % BRANCH_COLS,
+                            (sid,))
         mrows = store.query("SELECT id, parent_id, role, content FROM messages WHERE session_id=?", (sid,))
     by_id = {r[0]: r for r in brows}
     if not active_bid or active_bid not in by_id:
-        active_bid = default_bid
+        active_bid = main_bid
 
     parents = {r[0]: r[1] for r in mrows}
-    msg_meta = {r[0]: (r[2], r[3]) for r in mrows}
+    msg_meta = {}
+    for r in mrows:
+        try:
+            content = json.loads(r[3])
+        except ValueError:
+            content = []
+        msg_meta[r[0]] = (r[2], r[3], content)
 
     paths = {}
     own_sets = {}
     for r in brows:
-        bid = r[0]
-        origin_id = r[3]
-        head_id = r[4]
+        bid, origin_id, head_id = r[0], r[3], r[4]
         p = path_ids(store, sid, head_id, parents)
         paths[bid] = p
-        if origin_id is not None and origin_id in p:
-            own_sets[bid] = set(p[p.index(origin_id) + 1:])
-        else:
-            own_sets[bid] = set(p)
+        own_sets[bid] = set(p[p.index(origin_id) + 1:]) if origin_id is not None and origin_id in p else set(p)
 
     active_path = paths.get(active_bid, [])
     active_set = set(active_path)
-    m_bid = next((r[0] for r in brows if r[5] == "main"), brows[0][0] if brows else None)
+    root_bid = next((r[0] for r in brows if r[5] in ("root", "main")), brows[0][0])
 
     # Resolve parent_branch_id: prefer stored parent_branch_id if valid; else owner of spawned_at_id/origin_id
     parent_branch = {}
     for r in brows:
-        bid, _, _, origin_id, _, kind, _, _, stored_pb, spawned_at, ctx_mode = r
-        if kind == "main":
+        bid, kind, stored_pb, spawned_at, origin_id = r[0], r[5], r[8], r[9], r[3]
+        if bid == root_bid:
             parent_branch[bid] = None
             continue
         if stored_pb and stored_pb != bid and stored_pb in by_id:
@@ -569,12 +582,12 @@ def tree_info(agent, sid, active_bid=None):
             continue
         anchor = spawned_at if spawned_at is not None else origin_id
         if anchor is None:
-            parent_branch[bid] = m_bid if bid != m_bid else None
+            parent_branch[bid] = root_bid
             continue
         owner = next((o[0] for o in brows if o[0] != bid and anchor in own_sets[o[0]]), None)
         if owner is None:
             owner = next((o[0] for o in brows if o[0] != bid and anchor in paths[o[0]]), None)
-        parent_branch[bid] = owner or (m_bid if bid != m_bid else None)
+        parent_branch[bid] = owner or root_bid
 
     sub_counts = {r[0]: 0 for r in brows}
     for r in brows:
@@ -588,14 +601,14 @@ def tree_info(agent, sid, active_bid=None):
     summaries = []
     sum_by_id = {}
     for r in brows:
-        bid, _, name, origin_id, head_id, kind, created_at, updated_at, _, spawned_at, ctx_mode = r
+        bid, _, name, origin_id, head_id, kind, created_at, updated_at, _, spawned_at, ctx_mode, expanded = r
+        kind = "root" if kind == "main" else (kind or "aside")
+        is_main = bid == main_bid
         p = paths[bid]
         ctx_mode = ctx_mode or ("fresh" if (kind == "subagent" and origin_id is None) else "fork")
         attach_id = spawned_at if spawned_at is not None else origin_id
-        if origin_id is not None and origin_id in p:
-            own = p[p.index(origin_id) + 1:]
-        else:
-            own = list(p)
+        own_start = p.index(origin_id) + 1 if origin_id is not None and origin_id in p else 0
+        own = p[own_start:]
         # Depth of the visual attachment point along parent's path (for conversation-order sorting)
         pb = parent_branch.get(bid)
         pp = paths.get(pb, []) if pb else []
@@ -605,18 +618,15 @@ def tree_info(agent, sid, active_bid=None):
             origin_depth = p.index(origin_id) + 1
         else:
             origin_depth = 0
-        prompts = sum(1 for mid in own if mid in msg_meta and _is_user_prompt(msg_meta[mid][0], json.loads(msg_meta[mid][1])))
+        prompts = sum(1 for mid in own if mid in msg_meta and _is_user_prompt(msg_meta[mid][0], msg_meta[mid][2]))
         fork_preview = ""
         if attach_id and attach_id in msg_meta:
-            t = _prompt_text(json.loads(msg_meta[attach_id][1]))
-            fork_preview = " ".join(t.split())[:80]
-        is_running = agent.branch_running(bid)
-        default_name = "Main" if kind == "main" else ("Subagent" if kind == "subagent" else "New aside")
+            fork_preview = _clip(_prompt_text(msg_meta[attach_id][2]), 80)
         s = {
             "id": bid,
-            "name": name or default_name,
+            "name": name or default_name(kind, is_main),
             "unnamed": not bool(name),
-            "kind": kind or "aside",
+            "kind": kind,
             "context_mode": ctx_mode,
             "origin_id": origin_id,
             "spawned_at_id": attach_id,
@@ -624,62 +634,67 @@ def tree_info(agent, sid, active_bid=None):
             "fork_preview": fork_preview,
             "parent_branch_id": parent_branch.get(bid),
             "head_id": head_id,
-            "status": "running" if is_running else "idle",
+            "status": "running" if agent.branch_running(bid) else "idle",
             "own_messages": len(own),
+            "inherited_messages": own_start,
             "total_messages": len(p),
             "prompt_count": prompts,
             "sub_branches": sub_counts.get(bid, 0),
             "is_active": bid == active_bid,
-            "is_main": kind == "main",
+            "is_main": is_main,
+            "expanded": bool(expanded),
+            "preview": _preview(p, msg_meta, own_start),
             "created_at": created_at,
             "updated_at": updated_at,
         }
         summaries.append(s)
         sum_by_id[bid] = s
 
-    # Compute inline fork/spawn points along `active_path`
-    forks = {}
+    active_sum = sum_by_id.get(active_bid)
+    active_parent = parent_branch.get(active_bid)
+    active_fresh = bool(active_sum and active_sum["context_mode"] == "fresh")
+
+    # Group the threads diverging from the viewed line by (fork message, first divergent message)
     grouped = {}
     for r in brows:
         bid = r[0]
         if bid == active_bid:
             continue
         s = sum_by_id[bid]
+        p = paths[bid]
         if s["context_mode"] == "fresh":
-            # Fresh-context subagent attaches directly at its `spawned_at_id` if on active_path
+            # a fresh-context subagent attaches at the message that spawned it, if that is on the viewed line
             attach = s["spawned_at_id"]
             if attach is not None and attach in active_set:
-                key = str(attach)
-                grouped.setdefault((key, ("fresh", bid)), []).append(bid)
-            elif parent_branch.get(bid) == active_bid:
-                grouped.setdefault(("root", ("fresh", bid)), []).append(bid)
+                grouped.setdefault((str(attach), ("fresh", bid)), {"bids": [], "start": 0})["bids"].append(bid)
+            elif parent_branch.get(bid) == active_bid or bid == active_parent:
+                grouped.setdefault(("root", ("fresh", bid)), {"bids": [], "start": 0})["bids"].append(bid)
             continue
-        # Forked thread: find LCA with active_path
-        p = paths[bid]
-        lca = next((mid for mid in reversed(p) if mid in active_set), None)
-        # For a forked subagent whose spawned_at_id is on active_path (one message after origin_id), attach visually at spawned_at_id
+        # a forked subagent attaches visually at its spawned_at_id (one message after its origin)
         if s["kind"] == "subagent" and s["spawned_at_id"] in active_set:
-            key = str(s["spawned_at_id"])
-            grouped.setdefault((key, ("sub", bid)), []).append(bid)
+            start = p.index(s["origin_id"]) + 1 if s["origin_id"] in p else 0
+            grouped.setdefault((str(s["spawned_at_id"]), ("sub", bid)), {"bids": [], "start": start})["bids"].append(bid)
             continue
+        lca = next((mid for mid in reversed(p) if mid in active_set), None)
         key = str(lca) if lca is not None else "root"
-        if lca is None:
-            fa = p[0] if p else None
-        else:
-            idx = p.index(lca)
-            fa = p[idx + 1] if idx + 1 < len(p) else None
+        idx = p.index(lca) if lca is not None else -1
+        fa = p[idx + 1] if idx + 1 < len(p) else None
         gkey = (key, ("msg", fa) if fa is not None else ("self", bid))
-        grouped.setdefault(gkey, []).append(bid)
+        grouped.setdefault(gkey, {"bids": [], "start": idx + 1})["bids"].append(bid)
 
-    for (key, _), bids in grouped.items():
-        def rank(bid):
-            s = sum_by_id[bid]
-            return (0 if s["is_main"] else 1,
-                    0 if s["origin_id"] == (None if key == "root" else int(key)) else 1,
-                    s["created_at"] or 0)
-        bids.sort(key=rank)
+    def order(bid):
+        x = sum_by_id[bid]
+        return (x["created_at"] or 0, x["name"].lower(), bid)
+
+    forks = {}
+    parent_link = None
+    for (key, _), g in grouped.items():
+        bids = g["bids"]
+        # the representative is the thread that diverges at this point first (the others continue from it)
+        bids.sort(key=lambda b: (0 if b == active_parent else 1,
+                                 0 if sum_by_id[b]["spawned_at_id"] == (None if key == "root" else int(key)) else 1,
+                                 order(b)))
         rep = sum_by_id[bids[0]]
-        extra = len(bids) - 1
         chip = {
             "branch_id": rep["id"],
             "name": rep["name"],
@@ -688,23 +703,54 @@ def tree_info(agent, sid, active_bid=None):
             "status": "running" if any(sum_by_id[x]["status"] == "running" for x in bids) else rep["status"],
             "own_messages": rep["own_messages"],
             "is_main": rep["is_main"],
-            "nested": extra,
+            "nested": len(bids) - 1,
+            "created_at": rep["created_at"],
+            "preview": _preview(paths[rep["id"]], msg_meta, g["start"]),
         }
+        if rep["id"] == active_parent:
+            parent_link = dict(chip, at=key)
+            continue
+        if key == "root" and active_fresh and parent_branch.get(rep["id"]) != active_bid:
+            continue  # a fresh thread shares no messages: only its own children attach at its top
         forks.setdefault(key, []).append(chip)
+    if active_parent and parent_link is None and active_parent in sum_by_id:
+        ps = sum_by_id[active_parent]
+        at = "root" if active_fresh or active_sum["origin_id"] is None else str(active_sum["origin_id"])
+        parent_link = {"branch_id": ps["id"], "name": ps["name"], "kind": ps["kind"],
+                       "context_mode": ps["context_mode"], "status": ps["status"], "own_messages": ps["own_messages"],
+                       "is_main": ps["is_main"], "nested": 0, "created_at": ps["created_at"], "at": at,
+                       "preview": {"prompt": "", "reply": ""}}
 
+    if parent_link and parent_link["at"] in forks:
+        # siblings (other threads forking where this one forks) are not shown; reach them via the parent
+        at = parent_link["at"]
+        forks[at] = [c for c in forks[at] if parent_branch.get(c["branch_id"]) == active_bid]
+        if not forks[at]:
+            del forks[at]
     for key in forks:
-        forks[key].sort(key=lambda c: (0 if c["is_main"] else 1 if c["kind"] == "aside" else 2 if c["kind"] == "subagent" else 3,
-                                       sum_by_id[c["branch_id"]]["created_at"] or 0))
+        forks[key].sort(key=lambda c: (c["created_at"] or 0, c["name"].lower(), c["branch_id"]))
 
-    active_sum = sum_by_id.get(active_bid)
     return {
         "active_branch_id": active_bid,
-        "main_branch_id": m_bid,
+        "main_branch_id": main_bid,
+        "root_branch_id": root_bid,
         "active_origin_id": active_sum["origin_id"] if active_sum else None,
         "active_context_mode": active_sum["context_mode"] if active_sum else "fork",
         "branches": summaries,
         "forks": forks,
+        "parent_link": parent_link,
     }
+
+
+def set_expanded(agent, sid, branch_ref, expanded):
+    """Stores whether a thread shows its inherited history (per thread, shared by all tabs) and syncs tabs."""
+    agent.require(sid)
+    store = agent.store
+    with store.lock:
+        bid = resolve(store, sid, branch_ref)
+        store.execute("UPDATE branches SET expanded=? WHERE session_id=? AND id=?", (1 if expanded else 0, sid, bid))
+    emit_updated(agent, sid)
+    return {"branch_id": bid, "expanded": bool(expanded)}
 
 
 def all_branch_data(agent, sid):
@@ -727,9 +773,14 @@ def all_branch_data(agent, sid):
         if r[2] == "user" and is_prompt(json.loads(r[3])):
             counts[r[5]] = counts.get(r[5], 0) + 1
     msgs = {str(mid): message_dict(rows[mid], counts.get(rows[mid][5])) for mid in needed if mid in rows}
-    info = dict(info, branches=[dict(b, status="idle") for b in info["branches"]],
-                forks={k: [dict(c, status="idle") for c in v] for k, v in info["forks"].items()})
-    return {"info": info, "threads": threads, "messages": msgs}
+    def idle(i):
+        pl = i.get("parent_link")
+        return dict(i, branches=[dict(b, status="idle") for b in i["branches"]],
+                    forks={k: [dict(c, status="idle") for c in v] for k, v in i["forks"].items()},
+                    parent_link=dict(pl, status="idle") if pl else None)
+    # one precomputed view per thread (forks, parent link, previews relative to that thread)
+    views = {b["id"]: idle(tree_info(agent, sid, active_bid=b["id"])) for b in info["branches"]}
+    return {"info": idle(info), "views": views, "threads": threads, "messages": msgs}
 
 
 def emit_updated(agent, sid):
@@ -822,10 +873,11 @@ def system_note(agent, sid, current_bid=None):
     if cur and cur["kind"] == "subagent":
         parts.append(SUBAGENT_SYSTEM_NOTE)
     others = [b for b in info["branches"]
-              if b["id"] != cur_bid and b["kind"] in ("main", "aside", "subagent")
+              if b["id"] != cur_bid and b["kind"] in ("root", "aside", "subagent")
               and (b["own_messages"] > 0 or b["status"] == "running")]
     if others:
-        cur_desc = '"%s" (%s, id=%s)' % (cur["name"], cur["kind"], cur["id"]) if cur else str(cur_bid)
+        cur_desc = '"%s" (%s%s, id=%s)' % (cur["name"], cur["kind"], ", main" if cur["is_main"] else "",
+                                            cur["id"]) if cur else str(cur_bid)
         lines = [
             "# Session threads (metadata only)",
             "You are currently on thread %s of this session. Other threads exist in this session:" % cur_desc,
@@ -834,8 +886,8 @@ def system_note(agent, sid, current_bid=None):
             fork = ("after msg #%d" % b["spawned_at_id"]) if b["spawned_at_id"] else "from root"
             ctx = "fresh context" if b["context_mode"] == "fresh" else "forked context"
             st = " [running]" if b["status"] == "running" else ""
-            lines.append('- %s "%s" (%s, %s, %s, %d msgs%s)' % (
-                b["id"], b["name"], b["kind"], ctx, fork, b["own_messages"], st))
+            lines.append('- %s "%s" (%s%s, %s, %s, %d msgs%s)' % (
+                b["id"], b["name"], b["kind"], ", main" if b["is_main"] else "", ctx, fork, b["own_messages"], st))
         lines.append(
             "\nIMPORTANT: Do NOT read full side-branches (user asides) or contact them on your own. Only look at "
             "this metadata (or call `threads` for fresh status) and ask the user if you should check in — unless "
@@ -853,7 +905,7 @@ def branches_text(agent, sid, current_bid=None):
     cur_bid = current_bid or info["active_branch_id"]
     out = ["Threads in this session (metadata only):"]
     for b in info["branches"]:
-        tags = [b["kind"], b["context_mode"]]
+        tags = [b["kind"]] + (["main"] if b["is_main"] else []) + [b["context_mode"]]
         if b["id"] == cur_bid:
             tags.append("current")
         if b["status"] == "running":

@@ -92,10 +92,11 @@ class TestBranches(unittest.TestCase):
         self.assertNotEqual(aside_bid, main_bid)
         self.assertEqual(len(snap1["messages"]), 6)
         self.assertEqual(texts(snap1["messages"][4]), "quick detour about ports")
-        # Main branch appears as a fork at message #4 (the last shared message)
+        # Main is the aside's parent: the left-hand parent link at message #4 (the last shared message)
         fork_key = str(msgs0[3]["id"])
-        self.assertIn(fork_key, snap1["branches"]["forks"])
-        self.assertEqual(snap1["branches"]["forks"][fork_key][0]["branch_id"], main_bid)
+        self.assertNotIn(fork_key, snap1["branches"]["forks"])
+        self.assertEqual(snap1["branches"]["parent_link"]["branch_id"], main_bid)
+        self.assertEqual(snap1["branches"]["parent_link"]["at"], fork_key)
 
         # Switch back to main via /branch main
         self.c.call("chat.send", {"session_id": sid, "text": "/branch main"})
@@ -147,7 +148,7 @@ class TestBranches(unittest.TestCase):
         info3 = self.c.call("branches.list", {"session_id": sid})
         self.assertEqual(info3["main_branch_id"], aside_bid)  # 3 prompts & deeper past fork -> promoted!
         old_main = next(b for b in info3["branches"] if b["id"] == main_bid)
-        self.assertEqual(old_main["kind"], "aside")
+        self.assertEqual(old_main["kind"], "root")
         self.assertFalse(old_main["is_main"])
 
     def test_agent_metadata_ask_branch_and_message_branch(self):
@@ -253,6 +254,101 @@ class TestBranches(unittest.TestCase):
         self.assertEqual(len(snap["info"]["branches"]), 2)
         self.assertEqual(len(snap["threads"]), 2)
         self.assertIn(aside_bid, snap["threads"])
+        # one precomputed view per thread for the offline spatial view (parent link, forks, previews)
+        self.assertEqual(set(snap["views"]), {main_bid, aside_bid})
+        self.assertEqual(snap["views"][aside_bid]["parent_link"]["branch_id"], main_bid)
+        self.assertEqual(snap["views"][aside_bid]["active_branch_id"], aside_bid)
+
+    def branch(self, info, bid):
+        return next(b for b in info["branches"] if b["id"] == bid)
+
+    def test_main_is_a_tag(self):
+        sid = self.new_session()
+        self.send_and_wait(sid, "initial setup")
+        root_bid = self.c.call("sessions.subscribe", {"session_id": sid})["branch_id"]
+        info0 = self.c.call("branches.list", {"session_id": sid})
+        self.assertEqual(self.branch(info0, root_bid)["kind"], "root")
+        self.send_and_wait(sid, "/aside option B")
+        aside_bid = self.c.call("sessions.subscribe", {"session_id": sid})["branch_id"]
+        self.c.call("branches.rename", {"session_id": sid, "branch_id": aside_bid, "title": "option B"})
+        # switching/creating threads is per tab: the session's default thread is still main (the root)
+        self.assertEqual(self.c.call("sessions.list", {}) and
+                         next(s for s in self.c.call("sessions.list", {}) if s["id"] == sid)["main_branch_id"], root_bid)
+        order0 = [b["id"] for b in self.c.call("branches.list", {"session_id": sid})["branches"]]
+
+        promoted = self.c.call("branches.promote", {"session_id": sid, "branch_id": aside_bid})
+        self.assertTrue(promoted["is_main"])
+        info = self.c.call("branches.list", {"session_id": sid})
+        self.assertEqual(info["main_branch_id"], aside_bid)
+        # like a git tag: nothing re-kinded, renamed or reordered
+        self.assertEqual(self.branch(info, root_bid)["kind"], "root")
+        self.assertEqual(self.branch(info, root_bid)["name"], "Original")
+        self.assertEqual(self.branch(info, aside_bid)["kind"], "aside")
+        self.assertEqual(self.branch(info, aside_bid)["name"], "option B")
+        self.assertEqual([b["id"] for b in info["branches"]], order0)
+        # main is the default thread of a new tab, the target of /branch main and the session's message count
+        c2 = self.server.rpc()
+        self.addCleanup(c2.close)
+        c2.call("hello", {"client": "web"})
+        snap = c2.call("sessions.subscribe", {"session_id": sid})
+        self.assertEqual(snap["branch_id"], aside_bid)
+        self.assertEqual(snap["session"]["main_branch_id"], aside_bid)
+        self.assertEqual(snap["session"]["message_count"], 4)
+        c2.call("branches.switch", {"session_id": sid, "branch_id": root_bid})
+        c2.call("chat.send", {"session_id": sid, "text": "/branch main"})
+        wait_event(c2, lambda n, d: n == "branch.switched" and d["branch_id"] == aside_bid)
+        # deleting the main thread moves the tag to its parent
+        self.c.call("branches.delete", {"session_id": sid, "branch_id": aside_bid})
+        info = self.c.call("branches.list", {"session_id": sid})
+        self.assertEqual(info["main_branch_id"], root_bid)
+        self.assertEqual(self.branch(info, root_bid)["name"], "Main")
+
+    def test_expanded_state_syncs_across_tabs(self):
+        sid = self.new_session()
+        self.send_and_wait(sid, "base question")
+        self.send_and_wait(sid, "/aside side question")
+        aside_bid = self.c.call("sessions.subscribe", {"session_id": sid})["branch_id"]
+        info = self.c.call("branches.list", {"session_id": sid})
+        self.assertFalse(self.branch(info, aside_bid)["expanded"])
+        self.assertEqual(self.branch(info, aside_bid)["inherited_messages"], 2)
+        c2 = self.server.rpc()
+        self.addCleanup(c2.close)
+        c2.call("hello", {"client": "web"})
+        c2.call("sessions.subscribe", {"session_id": sid, "branch_id": aside_bid})
+        self.c.call("branches.set_expanded", {"session_id": sid, "branch_id": aside_bid, "expanded": True})
+        ev, _ = wait_event(c2, lambda n, d: n == "branches.updated" and any(
+            b["id"] == aside_bid and b["expanded"] for b in d["branches"]["branches"]))
+        self.assertEqual(ev["data"]["branches"]["active_branch_id"], aside_bid)
+        self.c.call("branches.set_expanded", {"session_id": sid, "branch_id": aside_bid, "expanded": False})
+        self.assertFalse(self.branch(c2.call("branches.list", {"session_id": sid}), aside_bid)["expanded"])
+
+    def test_spatial_parent_link_previews_and_order(self):
+        sid = self.new_session()
+        self.send_and_wait(sid, "first question")
+        self.send_and_wait(sid, "second question")
+        root_bid = self.c.call("sessions.subscribe", {"session_id": sid})["branch_id"]
+        msgs = self.c.call("sessions.subscribe", {"session_id": sid})["messages"]
+        at = msgs[1]["id"]  # the first reply
+        bids = []
+        for prompt in ("alpha detour", "beta detour", "gamma detour"):
+            self.c.call("branches.switch", {"session_id": sid, "branch_id": root_bid})
+            r = self.c.call("branches.create", {"session_id": sid, "from_message_id": at, "prompt": prompt})
+            bids.append(r["branch"]["id"])
+            wait_idle(self.c, sid)
+        info = self.c.call("sessions.subscribe", {"session_id": sid, "branch_id": root_bid})["branches"]
+        chips = info["forks"][str(at)]
+        self.assertEqual([c["branch_id"] for c in chips], bids)  # creation order
+        self.assertEqual(chips[0]["preview"]["prompt"], "alpha detour")
+        self.assertEqual(chips[0]["preview"]["reply"], "**Mock reply** to: alpha detour")
+        self.assertIsNone(info["parent_link"])
+        # from an aside: the parent is on the left with its continuation as preview; siblings are hidden
+        info = self.c.call("sessions.subscribe", {"session_id": sid, "branch_id": bids[1]})["branches"]
+        pl = info["parent_link"]
+        self.assertEqual((pl["branch_id"], pl["at"]), (root_bid, str(at)))
+        self.assertEqual(pl["preview"]["prompt"], "second question")
+        self.assertNotIn(str(at), info["forks"])
+        b = self.branch(info, bids[1])
+        self.assertEqual((b["inherited_messages"], b["own_messages"]), (2, 2))
 
 
 if __name__ == "__main__":

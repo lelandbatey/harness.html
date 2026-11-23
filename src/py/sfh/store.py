@@ -124,6 +124,17 @@ MIGRATIONS = [
     ALTER TABLE branches ADD COLUMN context_mode TEXT;
     UPDATE branches SET spawned_at_id = origin_id, context_mode = 'fork' WHERE context_mode IS NULL;
     """,
+    # 10: main is a tag (sessions.main_branch_id), the first thread is kind 'root'; per-thread collapsed state
+    """
+    ALTER TABLE sessions ADD COLUMN main_branch_id TEXT;
+    ALTER TABLE branches ADD COLUMN expanded INT;
+    UPDATE sessions SET main_branch_id = (SELECT b.id FROM branches b WHERE b.session_id = sessions.id
+                                          AND b.kind = 'main' ORDER BY b.created_at LIMIT 1);
+    UPDATE branches SET kind = CASE WHEN origin_id IS NULL AND parent_branch_id IS NULL THEN 'root' ELSE 'aside' END
+        WHERE kind = 'main';
+    UPDATE branches SET kind = 'root' WHERE kind = 'aside' AND origin_id IS NULL AND parent_branch_id IS NULL;
+    UPDATE branches SET name = NULL WHERE kind = 'root' AND name IN ('Main', 'Previous main');
+    """,
 ]
 
 

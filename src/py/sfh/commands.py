@@ -75,7 +75,7 @@ async def handle(server, client, sid, text, branch_id=None):
             rest = rest.strip()
             if sub == "promote":
                 b = branches.promote(agent, sid, rest or bid)
-                notice("Branch **%s** (`%s`) is now the main branch." % (b["name"], b["id"]), everyone=True)
+                notice("Thread **%s** (`%s`) is now the main thread (★)." % (b["name"], b["id"]), everyone=True)
             elif sub == "rename":
                 if not rest:
                     return notice("usage: `/branch rename <title>`", "error")
