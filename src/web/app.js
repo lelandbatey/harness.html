@@ -814,9 +814,20 @@
     return c;
   }
 
+  // Resizing via height:auto briefly collapses the textarea. For the composer that grows the flex'd
+  // .chat-scroll above it, which clamps its scrollTop; once the height is restored the conversation is
+  // left scrolled up (its bottom hidden behind the composer). So save the scroll position and restore it:
+  // for the composer keep the distance from the bottom (a growing composer then pushes the conversation
+  // up instead of covering it); for textareas inside the conversation (message edit) keep scrollTop.
   function autoGrow(ta) {
+    var sc = cur && cur.scroll && cur.root && cur.root.contains(ta) ? cur.scroll : null;
+    var inside = sc ? sc.contains(ta) : false;
+    var top = sc ? sc.scrollTop : 0;
+    var fromBottom = sc ? sc.scrollHeight - sc.clientHeight - sc.scrollTop : 0;
     ta.style.height = "auto";
     ta.style.height = Math.min(ta.scrollHeight, window.innerHeight * 0.4) + "px";
+    if (!sc) return;
+    sc.scrollTop = inside ? top : Math.max(0, sc.scrollHeight - sc.clientHeight - fromBottom);
   }
 
   function openChat(id, bid) {
