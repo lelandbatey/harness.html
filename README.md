@@ -100,9 +100,12 @@ This harness runs in server mode with an HTTP/websocket API, and has two clients
   - Titles for sessions are formatted as briefly as possible, most specific first, and not starting
     with a verb. e.g. instead of "Apply and merge foo-project PR 231" it should be "foo-project PR
     231 apply and merge"
+  - Threads each have titles calculated automatically, same as sessions
 - Support for `/` commands like `/retitle` which re-calculates a title via LLM call or `/btw` which
   gets a response that doesn't go directly into the chat context, but uses the context to answer
   - support for a "compaction" `/compact` command
+  - `/retitle` in the "main" thread of a session updates the title for that thread AND the title for
+    the session, while `/retitle` in a side thread updates the title of that thread
 - Streaming response from the LLM
 - The system prompt is visible in the settings and modifiable
 - There's a built-in skill (which can be disabled) for asking the LLM to edit this harness, or any
@@ -128,9 +131,12 @@ This harness runs in server mode with an HTTP/websocket API, and has two clients
   expanded to show the full thinking/reasoning. By default, "thinking" lines are minimized so as not
   to dominate the entire screen with scrolling text.
 - The user can "branch" conversations in a more "lightweight" way than forking an entire
-  conversation as a copy. Instead the user can start an `/aside` to fork a new branch from the
-  current message, then switch between branches of the conversation. How that looks is UI defined
-  - An aside can turn into the new "main session" if the user just keeps chatting there
+  conversation as a copy. Instead the user can start an `/aside` to fork a new branch/thread from
+  the current message, then switch between branches of the conversation. How that looks is UI
+  defined.
+  - An aside can turn into the new "main session" if the user just keeps chatting there. Changing
+    which thread is the "main" thread does not change the title of any session, just changes which
+    thread is pointed at by the "main" designation.
   - Agents can see the side-branches of their session, and can even talk to those branches like
     subagents, or ask them one-shot questions like users can with `/btw`
   - Agents are encouraged not to read the whole branches off to the side, only look at metadata and
@@ -232,6 +238,64 @@ This harness runs in server mode with an HTTP/websocket API, and has two clients
       - dashed lines/outlines for subagents
       - solid lines for forks
       - Same icons as used for the different kinds
+  - The minimap displays as a floating semi-transparent sublime text style minimap, and when clicked
+    can be expanded into an interactable sidebar which can be closed back to a minimap
+  - The minimap should display like a "git graph" with nodes for every branch point. Conceptually,
+    think of this like a git graph, where every user message is a commit and every "final message
+    in an agents turn" is also a commit on the git graph. however, all "straight-line" commits
+    should be omitted for brevity. So a message history like this:
+      ```
+    * User message: Investigate XYZ
+    |
+    * Agent turn message: Summary of XYZ
+    |
+    * User message: What about consideration ABC
+    |
+    * Agent turn message: How ABC affects XYZ
+    |
+    * User message: Plan for solving XYZ
+    |
+    * Agent turn message: Here's a plan for solving XYZ
+    | \
+    |  |
+    |  * User message: Iplament solution for XXZ  # first message sent, user misspelled so edits
+    |
+    * ↺ User message: Implement solution for XYZ # It's result of edit, so it gets ↺ symbol
+    |
+    * Agent turn message: Solution is implemented for XYZ
+    | \
+    |  |
+    |  * User message: Could we consider a tweak PQR for the implementation here?
+    |
+    * User message: Review implementation for XYZ
+      ```
+    Would be displayed like this in the minimap:
+      ```
+    * User message: Investigate XYZ
+    |
+    * Agent turn message: Here's a plan for solving XYZ
+    | \
+    |  * User message: Iplament solution for XXZ  # first message sent, user misspelled so edits
+    |
+    * ↺ User message: Implement solution for XYZ # It's result of edit, so it gets ↺ symbol
+    |
+    * Agent turn message: Solution is implemented for XYZ
+    | \
+    |  * User message: Could we consider a tweak PQR for the implementation here?
+    |
+    * User message: Review implementation for XYZ
+      ```
+    - Note though that in the real implementation, the minimap view would not show actual excerpts
+      from the messages. Instead, it'd show
+      - The first message in a new branch would have the title of the thread per how titles are calculated.
+      - a smaller no-title node display
+    - Fresh subagents attach to the parent agents turns final message (in the minimap, spacial view
+      has different rules)
+    - Row order is to use whatever `git log --graph` uses, which should be time-order
+    - Clicking a node in the minimap switches to its thread AND scrolls to that message
+    - Per thread controls in the minimap are shown on hover over any node in that thread.
+    - When `main` changes, the thread marked as `main` becomes the leftmost branch in the graph (the
+      long straight one).
 
 
 ## Minimal TUI features
